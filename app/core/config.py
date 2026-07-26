@@ -15,10 +15,9 @@ class Settings(BaseSettings):
     # Threads API
     THREADS_APP_ID: str
     THREADS_APP_SECRET: str
-    THREADS_REDIRECT_URI: str  # https://api.твойдомен.ru/oauth/threads/callback
+    THREADS_REDIRECT_URI: str
 
-    # Шифрование токенов: 32 байта в base64. Сгенерить:
-    # python -c "import os,base64;print(base64.b64encode(os.urandom(32)).decode())"
+    # Шифрование токенов: 32 байта в base64
     TOKEN_ENC_KEY: str
 
     # LLM
@@ -26,14 +25,17 @@ class Settings(BaseSettings):
 
     # Робокасса
     ROBOKASSA_LOGIN: str
-    ROBOKASSA_PASS1: str  # для формирования ссылки на оплату
-    ROBOKASSA_PASS2: str  # для проверки вебхука ResultURL
+    ROBOKASSA_PASS1: str
+    ROBOKASSA_PASS2: str
     ROBOKASSA_TEST_MODE: bool = True
 
     # API-процесс
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
-    PUBLIC_BASE_URL: str = ""  # https://api.твойдомен.ru
+    PUBLIC_BASE_URL: str = ""
+
+    # Админы бота: telegram_id через запятую, например "123456,7891011"
+    ADMIN_IDS: str = ""
 
     class Config:
         env_file = ".env"
@@ -42,19 +44,18 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Тарифы. Кредиты - месячная квота, зачисляется при оплате/продлении.
-# Цены в рублях. Free выдаётся при регистрации разово.
 PLANS = {
     "free":  {"price": 0,    "credits": 30,   "title": "Free"},
     "start": {"price": 990,  "credits": 500,  "title": "Старт"},
     "pro":   {"price": 2490, "credits": 2000, "title": "Про"},
 }
 
-# Прайс действий в кредитах (Модули 1-3 будут списывать по этой таблице)
+# Прайс действий в кредитах
 CREDIT_COSTS = {
     "generate_post": 5,
     "rewrite": 4,
     "generate_thread": 12,
     "razbor": 3,
-    "voice_onboarding": 10,
+    "voice_onboarding": 0,   # онбординг голоса бесплатный - это активация
     "radar_search": 8,
 }
