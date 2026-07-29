@@ -15,6 +15,7 @@ from urllib.parse import urlencode, urlparse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.brain_writer import BrainWriter
 from app.core.crypto import decrypt_token
 from app.core.threads_api import create_container, publish_container
 
@@ -110,6 +111,23 @@ async def publish_one(session: AsyncSession, post_row) -> tuple[bool, str]:
             VALUES (:tpid, :acc, 0)
             ON CONFLICT (threads_post_id) DO NOTHING
         """), {"tpid": published_id, "acc": acc_id})
+
+        try:
+            async with session.begin_nested():
+                await BrainWriter(session).record_post_published(
+                    user_id,
+                    acc_id,
+                    scheduled_post_id=post_id,
+                    threads_post_id=published_id,
+                )
+        except Exception as exc:
+            log.warning(
+                "Brain post_published event failed post=%s "
+                "account=%s error_type=%s",
+                post_id,
+                acc_id,
+                type(exc).__name__,
+            )
 
         return True, f"✅ Пост опубликован.{first_comment_note}"
     except Exception as e:

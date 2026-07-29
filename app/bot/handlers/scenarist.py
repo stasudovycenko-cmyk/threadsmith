@@ -20,7 +20,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from sqlalchemy import text
 
-from app.core import credits, scenarist
+from app.core import credits, scenarist, social_brain
 from app.core.config import CREDIT_COSTS
 from app.core.db import Session
 from app.core.llm import LLMError
@@ -73,6 +73,48 @@ async def _require_voice(cb: CallbackQuery, uid: int) -> dict | None:
         await cb.answer()
         return None
     return profile
+
+
+async def _single_account_id(uid: int) -> int | None:
+    async with Session() as s:
+        rows = (await s.execute(text("""
+            SELECT id
+            FROM threads_accounts
+            WHERE user_id = :uid
+            ORDER BY id
+            LIMIT 2
+        """), {"uid": uid})).all()
+    return rows[0][0] if len(rows) == 1 else None
+
+
+async def _load_brain(uid: int, threads_account_id: int):
+    try:
+        async with Session() as s:
+            repo = social_brain.BrainRepo(s)
+            writer = social_brain.BrainWriter(s, repo)
+            brain = await writer.apply_backfill(
+                uid,
+                threads_account_id,
+            )
+            context = await social_brain.ContextBuilder(
+                repo
+            ).build_context(
+                brain.id,
+                "generation",
+                scenarist.GENERATION_BRAIN_BUDGET_TOKENS,
+            )
+            await s.commit()
+            return context
+    except Exception as exc:
+        log.warning(
+            "Social Brain unavailable uid=%s account=%s "
+            "error_type=%s; "
+            "using legacy context",
+            uid,
+            threads_account_id,
+            type(exc).__name__,
+        )
+        return None
 
 
 def _render(gen: dict) -> str:
@@ -253,7 +295,8 @@ async def cb_more(cb: CallbackQuery):
 # ---------- общий раннер ----------
 
 async def _run_generation(msg: Message, gen_type: str, inp: dict,
-                          override_user_tg: int | None = None):
+                          override_user_tg: int | None = None,
+                          threads_account_id: int | None = None):
     tg_id = override_user_tg or msg.from_user.id
     uid = await _uid(tg_id)
     cost = CREDIT_COSTS[gen_type]
@@ -270,7 +313,22 @@ async def _run_generation(msg: Message, gen_type: str, inp: dict,
     await msg.answer("Пишу...")
     try:
         if gen_type == "generate_post":
-            out = await scenarist.generate_post(profile, inp["topic"], inp.get("reference"))
+            account_id = (
+                threads_account_id
+                if threads_account_id is not None
+                else await _single_account_id(uid)
+            )
+            brain = (
+                await _load_brain(uid, account_id)
+                if account_id is not None
+                else None
+            )
+            out = await scenarist.generate_post(
+                profile,
+                inp["topic"],
+                inp.get("reference"),
+                brain=brain,
+            )
         elif gen_type == "rewrite":
             out = await scenarist.rewrite_post(profile, inp["source"])
         else:
