@@ -24,6 +24,35 @@ BASE = "https://graph.threads.net"
 SCOPES = "threads_basic,threads_content_publish,threads_manage_insights,threads_manage_replies,threads_keyword_search"
 
 
+class ThreadsAPIError(RuntimeError):
+    """Threads API error without secrets from request query params."""
+
+
+def _safe_response_error(response: httpx.Response) -> ThreadsAPIError:
+    method = response.request.method if response.request else "REQUEST"
+    path = response.request.url.path if response.request else "unknown"
+
+    try:
+        body = response.text.strip()
+    except Exception:
+        body = ""
+
+    # Не тащим гигантский body в логи/БД.
+    if len(body) > 800:
+        body = body[:800] + "...<truncated>"
+
+    detail = f"Threads API {method} {path} -> HTTP {response.status_code}"
+    if body:
+        detail += f": {body}"
+
+    return ThreadsAPIError(detail)
+
+
+def _raise_for_status_safe(response: httpx.Response) -> None:
+    if response.is_error:
+        raise _safe_response_error(response)
+
+
 def auth_link(state: str) -> str:
     params = {
         "client_id": settings.THREADS_APP_ID,
@@ -45,7 +74,7 @@ async def exchange_code(code: str) -> dict:
             "redirect_uri": settings.THREADS_REDIRECT_URI,
             "code": code,
         })
-        r.raise_for_status()
+        _raise_for_status_safe(r)
         return r.json()
 
 
@@ -57,7 +86,7 @@ async def to_long_lived(short_token: str) -> dict:
             "client_secret": settings.THREADS_APP_SECRET,
             "access_token": short_token,
         })
-        r.raise_for_status()
+        _raise_for_status_safe(r)
         return r.json()
 
 
@@ -67,7 +96,7 @@ async def refresh_long_lived(token: str) -> dict:
             "grant_type": "th_refresh_token",
             "access_token": token,
         })
-        r.raise_for_status()
+        _raise_for_status_safe(r)
         return r.json()
 
 
@@ -78,7 +107,7 @@ async def get_me(token: str) -> dict:
             "fields": "id,username,threads_profile_picture_url",
             "access_token": token,
         })
-        r.raise_for_status()
+        _raise_for_status_safe(r)
         return r.json()
 
 
@@ -99,13 +128,13 @@ async def create_container(token: str, threads_user_id: str, text: str,
     async with httpx.AsyncClient(timeout=30) as c:
         last = None
         for attempt in range(6):
-            r = await c.post(f"{BASE}/v1.0/me/threads", params=params)
+            r = await c.post(f"{BASE}/v1.0/{threads_user_id}/threads", params=params)
             if r.status_code == 200:
                 return r.json()["id"]
             last = r
             if attempt < 5:
                 await asyncio.sleep(5)
-        last.raise_for_status()
+        _raise_for_status_safe(last)
         return last.json()["id"]
 
 
@@ -115,7 +144,7 @@ async def publish_container(token: str, threads_user_id: str,
     async with httpx.AsyncClient(timeout=30) as c:
         last = None
         for attempt in range(6):
-            r = await c.post(f"{BASE}/v1.0/me/threads_publish",
+            r = await c.post(f"{BASE}/v1.0/{threads_user_id}/threads_publish",
                              params={"access_token": token,
                                      "creation_id": container_id})
             if r.status_code == 200:
@@ -123,7 +152,7 @@ async def publish_container(token: str, threads_user_id: str,
             last = r
             if attempt < 5:
                 await asyncio.sleep(5)
-        last.raise_for_status()
+        _raise_for_status_safe(last)
         return last.json()["id"]
 
 
@@ -134,7 +163,7 @@ async def get_replies(token: str, post_id: str) -> list[dict]:
             "fields": "id,text,username,timestamp",
             "access_token": token,
         })
-        r.raise_for_status()
+        _raise_for_status_safe(r)
         return r.json().get("data", [])
 
 
@@ -151,7 +180,7 @@ async def keyword_search(token: str, query: str,
             "fields": "id,text,username",
             "access_token": token,
         })
-        r.raise_for_status()
+        _raise_for_status_safe(r)
         return r.json().get("data", [])
 
 
@@ -162,7 +191,7 @@ async def get_insights(token: str, post_id: str) -> dict:
             "metric": "views,likes,replies,reposts,quotes,shares",
             "access_token": token,
         })
-        r.raise_for_status()
+        _raise_for_status_safe(r)
         data = r.json().get("data", [])
         metrics = {}
         for item in data:
