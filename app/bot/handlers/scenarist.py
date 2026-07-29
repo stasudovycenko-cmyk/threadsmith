@@ -51,6 +51,8 @@ def scenarist_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="🔁 Рерайт", callback_data="sc:rw")],
         [InlineKeyboardButton(text="🧵 Ветка", callback_data="sc:thread"),
          InlineKeyboardButton(text="🎙 Мой голос", callback_data="sc:voice")],
+        [InlineKeyboardButton(text="⚙️ Настройка голоса", callback_data="vs:menu")],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data="home")],
     ])
 
 

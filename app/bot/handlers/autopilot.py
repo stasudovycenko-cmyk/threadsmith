@@ -39,6 +39,8 @@ def ap_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 Запланировать пост", callback_data="ap:new")],
         [InlineKeyboardButton(text="📋 Очередь", callback_data="ap:queue"),
          InlineKeyboardButton(text="🤖 Автоответы", callback_data="ap:rules")],
+        [InlineKeyboardButton(text="✨ Автопостинг", callback_data="ac:menu")],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data="home")],
     ])
 
 
@@ -149,13 +151,13 @@ async def cb_queue(cb: CallbackQuery):
         return
     kb = []
     lines = []
-    for pid, body, run_at, status in rows:
-        preview = body[:40].replace("\n", " ")
-        lines.append(f"• {run_at.astimezone(MSK).strftime('%d.%m %H:%M')} - {preview}...")
-        kb.append([InlineKeyboardButton(text=f"❌ Снять: {preview[:25]}",
-                                        callback_data=f"ap:del:{pid}")])
+    for n, (pid, body, run_at, status) in enumerate(rows, 1):
+        preview = " ".join(body.split())[:30]
+        when = run_at.astimezone(MSK).strftime("%d.%m %H:%M")
+        kb.append([InlineKeyboardButton(text=when + " · " + preview,
+                                        callback_data=f"ap:view:{pid}")])
     await cb.message.answer(
-        "Очередь (мск):\n" + "\n".join(lines),
+        "Очередь на публикацию (мск). Жми пост, чтобы открыть:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
     )
     await cb.answer()
@@ -255,3 +257,40 @@ async def cb_rule_del(cb: CallbackQuery):
         ), {"rid": rid, "uid": uid})
         await s.commit()
     await cb.answer("Удалил")
+
+
+@router.callback_query(F.data.startswith("ap:view:"))
+async def cb_view(cb: CallbackQuery):
+    pid = int(cb.data.rsplit(":", 1)[1])
+    uid, _ = await _uid_and_acc(cb.from_user.id)
+    async with Session() as s:
+        row = (await s.execute(text(
+            "SELECT text, run_at, status FROM scheduled_posts "
+            "WHERE id = :pid AND user_id = :uid"), {"pid": pid, "uid": uid})).first()
+    if not row:
+        await cb.answer("Не нашёл", show_alert=True)
+        return
+    body, run_at, status = row
+    when = run_at.astimezone(MSK).strftime("%d.%m %H:%M мск")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚀 Опубликовать сейчас", callback_data=f"ap:now:{pid}")],
+        [InlineKeyboardButton(text="❌ Снять", callback_data=f"ap:del:{pid}")],
+        [InlineKeyboardButton(text="📋 К очереди", callback_data="ap:queue")],
+    ])
+    head = "Пост на " + when + " · " + status + " · " + str(len(body)) + " симв."
+    await cb.message.answer(head + chr(10) + chr(10) + body, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("ap:now:"))
+async def cb_now(cb: CallbackQuery):
+    pid = int(cb.data.rsplit(":", 1)[1])
+    uid, _ = await _uid_and_acc(cb.from_user.id)
+    async with Session() as s:
+        row = (await s.execute(text(
+            "UPDATE scheduled_posts SET run_at = now() - interval '2 minutes' "
+            "WHERE id = :pid AND user_id = :uid AND status = 'pending' RETURNING id"),
+            {"pid": pid, "uid": uid})).first()
+        await s.commit()
+    await cb.answer("Уйдёт в ближайшую минуту 🚀" if row else "Уже публикуется",
+                    show_alert=True)
