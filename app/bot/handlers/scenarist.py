@@ -20,7 +20,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from sqlalchemy import text
 
-from app.core import credits, scenarist
+from app.core import credits, scenarist, social_brain
 from app.core.config import CREDIT_COSTS
 from app.core.db import Session
 from app.core.llm import LLMError
@@ -73,6 +73,20 @@ async def _require_voice(cb: CallbackQuery, uid: int) -> dict | None:
         await cb.answer()
         return None
     return profile
+
+
+async def _load_brain(uid: int):
+    try:
+        async with Session() as s:
+            return await social_brain.build_brain_context(s, uid)
+    except Exception as exc:
+        log.warning(
+            "Social Brain unavailable uid=%s error_type=%s; "
+            "using legacy context",
+            uid,
+            type(exc).__name__,
+        )
+        return None
 
 
 def _render(gen: dict) -> str:
@@ -270,7 +284,13 @@ async def _run_generation(msg: Message, gen_type: str, inp: dict,
     await msg.answer("Пишу...")
     try:
         if gen_type == "generate_post":
-            out = await scenarist.generate_post(profile, inp["topic"], inp.get("reference"))
+            brain = await _load_brain(uid)
+            out = await scenarist.generate_post(
+                profile,
+                inp["topic"],
+                inp.get("reference"),
+                brain=brain,
+            )
         elif gen_type == "rewrite":
             out = await scenarist.rewrite_post(profile, inp["source"])
         else:

@@ -9,6 +9,13 @@ from app.schemas.llm import (
     ThreadGenerationResponse,
     VoiceProfileResponse,
 )
+from app.schemas.social_brain import (
+    AutocontentBrainContext,
+    GenerationBrainContext,
+    NeuroBrainContext,
+    RadarBrainContext,
+    SocialBrainContext,
+)
 
 __all__ = [
     "Hook",
@@ -18,4 +25,9 @@ __all__ = [
     "RadarAnalysisResponse",
     "ThreadGenerationResponse",
     "VoiceProfileResponse",
+    "AutocontentBrainContext",
+    "GenerationBrainContext",
+    "NeuroBrainContext",
+    "RadarBrainContext",
+    "SocialBrainContext",
 ]
