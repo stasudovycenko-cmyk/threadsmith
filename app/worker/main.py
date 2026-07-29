@@ -12,6 +12,7 @@ from app.core.crypto import decrypt_token, encrypt_token
 from app.core.db import Session
 from app.core.threads_api import refresh_long_lived
 from app.worker.autocontent import autocontent_planner
+from app.worker.feedback_jobs import feedback_loop_job
 from app.worker.m1_jobs import insights_snapshotter, library_crawler
 from app.worker.m3_jobs import comment_poller, publisher
 from app.worker.m4_jobs import neuro_hunter
@@ -56,6 +57,14 @@ async def main():
     sched.add_job(neuro_hunter, "interval", minutes=20, max_instances=1)
     sched.add_job(autocontent_planner, "interval", hours=1, max_instances=1)
     sched.add_job(insights_snapshotter, "cron", hour=3, minute=30)
+    sched.add_job(
+        feedback_loop_job,
+        "cron",
+        hour=4,
+        minute=15,
+        max_instances=1,
+        coalesce=True,
+    )
     sched.start()
     log.info("worker started")
     await asyncio.Event().wait()

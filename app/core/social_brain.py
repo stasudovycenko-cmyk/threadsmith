@@ -15,6 +15,7 @@ from app.core.context_builder import (
     estimate_text_tokens,
     estimate_tokens,
 )
+from app.core.feedback_loop import FeedbackLoop
 
 # Compatibility name for callers that handled the previous account error.
 SocialBrainAccountError = BrainOwnershipError
@@ -26,6 +27,7 @@ __all__ = [
     "BrainRepo",
     "BrainWriter",
     "ContextBuilder",
+    "FeedbackLoop",
     "PATTERN_CONTEXT_LIMIT",
     "PATTERN_MIN_CONFIDENCE",
     "PATTERN_MIN_SAMPLES",

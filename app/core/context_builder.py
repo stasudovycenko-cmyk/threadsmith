@@ -6,6 +6,7 @@ import math
 from typing import Any
 
 from app.core.brain_repo import BrainNotFoundError, BrainRepo
+from app.core.goal_metrics import normalize_goal
 from app.schemas.social_brain import (
     BrainRecord,
     BrainTask,
@@ -269,15 +270,20 @@ class ContextBuilder:
         brain = await self.repo.get(brain_id)
         if brain is None:
             raise BrainNotFoundError(f"Brain {brain_id} does not exist")
-        patterns = await self.repo.get_patterns(
-            brain_id,
-            min_samples=PATTERN_MIN_SAMPLES,
-            min_confidence=PATTERN_MIN_CONFIDENCE,
-            limit=PATTERN_CONTEXT_LIMIT,
-        )
+        parts = _brain_parts(brain)
+        goal = normalize_goal(parts["primary_goal"])
+        patterns = []
+        if goal.metric is not None:
+            patterns = await self.repo.get_patterns(
+                brain_id,
+                min_samples=PATTERN_MIN_SAMPLES,
+                min_confidence=PATTERN_MIN_CONFIDENCE,
+                limit=PATTERN_CONTEXT_LIMIT,
+                metric=goal.metric,
+            )
         payload = _task_payload(
             task,
-            _brain_parts(brain),
+            parts,
             [pattern.prompt_dict() for pattern in patterns],
         )
         compact, trimmed = _trim_to_budget(

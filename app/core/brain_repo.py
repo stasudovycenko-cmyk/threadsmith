@@ -1,12 +1,14 @@
 """Storage boundary for account-scoped Social Brain state."""
 
 import json
+from collections.abc import Sequence
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.brain_safety import assert_safe_payload
+from app.schemas.feedback import BrainPatternWrite
 from app.schemas.social_brain import (
     BrainPattern,
     BrainRecord,
@@ -59,6 +61,12 @@ _GET_BY_ACCOUNT_SQL = text(f"""
     FROM brains
     WHERE user_id = :uid
       AND threads_account_id = :account_id
+""")
+
+_LIST_BRAINS_SQL = text(f"""
+    SELECT {_BRAIN_COLUMNS}
+    FROM brains
+    ORDER BY id
 """)
 
 _CREATE_BRAIN_SQL = text(f"""
@@ -167,6 +175,73 @@ _GET_PATTERNS_SQL = text("""
     LIMIT :pattern_limit
 """)
 
+_GET_PATTERNS_BY_METRIC_SQL = text("""
+    SELECT
+        id,
+        brain_id,
+        kind,
+        key,
+        metric,
+        lift,
+        samples,
+        confidence,
+        updated_at
+    FROM brain_patterns
+    WHERE brain_id = :brain_id
+      AND metric = :metric
+      AND samples >= :min_samples
+      AND confidence >= :min_confidence
+    ORDER BY confidence DESC, samples DESC, abs(lift) DESC, id
+    LIMIT :pattern_limit
+""")
+
+_GET_MANAGED_PATTERN_KEYS_SQL = text("""
+    SELECT kind, key, metric
+    FROM brain_patterns
+    WHERE brain_id = :brain_id
+      AND kind = ANY(CAST(:managed_kinds AS text[]))
+""")
+
+_UPSERT_PATTERN_SQL = text("""
+    INSERT INTO brain_patterns (
+        brain_id,
+        kind,
+        key,
+        metric,
+        lift,
+        samples,
+        confidence,
+        updated_at
+    )
+    VALUES (
+        :brain_id,
+        :kind,
+        :key,
+        :metric,
+        :lift,
+        :samples,
+        :confidence,
+        now()
+    )
+    ON CONFLICT (brain_id, kind, key, metric)
+    DO UPDATE SET
+        lift = EXCLUDED.lift,
+        samples = EXCLUDED.samples,
+        confidence = EXCLUDED.confidence,
+        updated_at = now()
+    WHERE brain_patterns.lift IS DISTINCT FROM EXCLUDED.lift
+       OR brain_patterns.samples IS DISTINCT FROM EXCLUDED.samples
+       OR brain_patterns.confidence IS DISTINCT FROM EXCLUDED.confidence
+""")
+
+_DELETE_PATTERN_SQL = text("""
+    DELETE FROM brain_patterns
+    WHERE brain_id = :brain_id
+      AND kind = :kind
+      AND key = :key
+      AND metric = :metric
+""")
+
 
 def _brain_from_result(result: Any) -> BrainRecord | None:
     row = result.mappings().first()
@@ -243,6 +318,13 @@ class BrainRepo:
         )
         return _brain_from_result(result)
 
+    async def list_all(self) -> list[BrainRecord]:
+        result = await self.session.execute(_LIST_BRAINS_SQL)
+        return [
+            BrainRecord.model_validate(dict(row))
+            for row in result.mappings().all()
+        ]
+
     async def update_section(
         self,
         brain_id: int,
@@ -310,17 +392,101 @@ class BrainRepo:
         min_samples: int,
         min_confidence: float,
         limit: int,
+        metric: str | None = None,
     ) -> list[BrainPattern]:
+        statement = (
+            _GET_PATTERNS_BY_METRIC_SQL
+            if metric is not None
+            else _GET_PATTERNS_SQL
+        )
+        params: dict[str, Any] = {
+            "brain_id": brain_id,
+            "min_samples": min_samples,
+            "min_confidence": min_confidence,
+            "pattern_limit": limit,
+        }
+        if metric is not None:
+            params["metric"] = metric
         result = await self.session.execute(
-            _GET_PATTERNS_SQL,
-            {
-                "brain_id": brain_id,
-                "min_samples": min_samples,
-                "min_confidence": min_confidence,
-                "pattern_limit": limit,
-            },
+            statement,
+            params,
         )
         return [
             BrainPattern.model_validate(dict(row))
             for row in result.mappings().all()
         ]
+
+    async def replace_patterns(
+        self,
+        brain_id: int,
+        patterns: Sequence[BrainPatternWrite],
+        *,
+        managed_kinds: Sequence[str],
+        user_id: int | None = None,
+        account_id: int | None = None,
+    ) -> int:
+        """Replace one service's pattern projection without touching others."""
+        brain = await self.get(
+            brain_id,
+            user_id=user_id,
+            account_id=account_id,
+        )
+        if brain is None:
+            raise BrainNotFoundError(
+                f"Brain {brain_id} does not exist in the requested scope"
+            )
+
+        kinds = tuple(sorted({
+            kind.strip()
+            for kind in managed_kinds
+            if kind.strip()
+        }))
+        if not kinds:
+            raise ValueError("managed_kinds cannot be empty")
+
+        desired: dict[tuple[str, str, str], BrainPatternWrite] = {}
+        for pattern in patterns:
+            item = BrainPatternWrite.model_validate(pattern)
+            if item.kind not in kinds:
+                raise ValueError(
+                    f"pattern kind is outside managed scope: {item.kind}"
+                )
+            identity = (item.kind, item.key, item.metric)
+            if identity in desired:
+                raise ValueError(f"duplicate pattern identity: {identity}")
+            desired[identity] = item
+
+        result = await self.session.execute(
+            _GET_MANAGED_PATTERN_KEYS_SQL,
+            {
+                "brain_id": brain_id,
+                "managed_kinds": list(kinds),
+            },
+        )
+        existing = {
+            (str(row["kind"]), str(row["key"]), str(row["metric"]))
+            for row in result.mappings().all()
+        }
+
+        for identity in sorted(existing - set(desired)):
+            kind, key, metric = identity
+            await self.session.execute(
+                _DELETE_PATTERN_SQL,
+                {
+                    "brain_id": brain_id,
+                    "kind": kind,
+                    "key": key,
+                    "metric": metric,
+                },
+            )
+
+        for identity in sorted(desired):
+            item = desired[identity]
+            await self.session.execute(
+                _UPSERT_PATTERN_SQL,
+                {
+                    "brain_id": brain_id,
+                    **item.model_dump(),
+                },
+            )
+        return len(desired)
