@@ -164,5 +164,17 @@ async def get_insights(token: str, post_id: str) -> dict:
         })
         r.raise_for_status()
         data = r.json().get("data", [])
-        return {m["name"]: (m.get("values", [{}])[0].get("value", 0))
-                for m in data}
+        metrics = {}
+        for item in data:
+            name = item.get("name")
+            values = item.get("values")
+            if (
+                not name
+                or not isinstance(values, list)
+                or not values
+                or not isinstance(values[0], dict)
+                or "value" not in values[0]
+            ):
+                continue
+            metrics[name] = values[0]["value"]
+        return metrics

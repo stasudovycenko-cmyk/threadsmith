@@ -26,14 +26,12 @@ from app.schemas.feedback import (
     AccountFeedbackResult,
     BrainPatternWrite,
     FeedbackMetric,
-    GoalScore,
-    GoalSelection,
+    MetricScore,
     PatternAggregate,
     PostBaseline,
     PostFeature,
     PostPerformance,
 )
-from app.schemas.social_brain import BrainRecord
 
 THREADS_METRICS = (
     "views",
@@ -43,12 +41,13 @@ THREADS_METRICS = (
     "quotes",
     "shares",
 )
-ENGAGEMENT_COMPONENTS = (
+# `shares` remains recorded but is not required while Meta marks it as
+# in development and the local adapter can legitimately omit its key.
+ENGAGEMENT_REQUIRED_COMPONENTS = (
     "likes",
     "replies",
     "reposts",
     "quotes",
-    "shares",
 )
 FEEDBACK_METRICS: tuple[FeedbackMetric, ...] = (
     "views",
@@ -62,6 +61,7 @@ CONFIDENCE_DISPERSION_SCALE = 0.5
 SHORT_POST_MAX_CHARS = 160
 MEDIUM_POST_MAX_CHARS = 320
 FLOAT_PRECISION = 6
+FEEDBACK_PROJECTION_VERSION = 2
 
 MANAGED_PATTERN_KINDS = (
     "has_link",
@@ -97,63 +97,6 @@ _LOAD_POSTS_SQL = text("""
     ORDER BY post.run_at, post.id
 """)
 
-_CANONICAL_GOAL_SQL = text("""
-    SELECT
-        (
-            SELECT count(*)
-            FROM threads_accounts account
-            WHERE account.user_id = :uid
-        ) AS account_count,
-        settings.goal
-    FROM (SELECT 1) seed
-    LEFT JOIN autocontent_settings settings
-      ON settings.user_id = :uid
-""")
-
-_GOAL_ALIASES = {
-    "reach": {
-        "reach",
-        "views",
-        "охват",
-        "охваты",
-        "просмотры",
-    },
-    "engagement": {
-        "engagement",
-        "engagement rate",
-        "активность",
-        "вовлечение",
-        "вовлеченность",
-        "вовлечённость",
-    },
-    "followers": {
-        "follower",
-        "followers",
-        "подписчики",
-        "рост подписчиков",
-    },
-    "traffic": {
-        "clicks",
-        "traffic",
-        "клики",
-        "переходы",
-        "переходы по ссылке",
-        "трафик",
-    },
-    "leads": {
-        "lead",
-        "leads",
-        "лид",
-        "лиды",
-    },
-}
-
-_GOAL_METRICS: dict[str, FeedbackMetric] = {
-    "reach": "views",
-    "engagement": "engagement_rate",
-}
-
-
 def _round(value: float) -> float:
     return round(value, FLOAT_PRECISION)
 
@@ -186,39 +129,6 @@ def _metric_int(value: Any) -> int | None:
     return None
 
 
-def _raw_goal(value: Any) -> str | None:
-    if isinstance(value, str):
-        stripped = value.strip()
-        return stripped or None
-    if isinstance(value, dict):
-        for key in ("value", "name", "key", "goal"):
-            candidate = value.get(key)
-            if isinstance(candidate, str) and candidate.strip():
-                return candidate.strip()
-    return None
-
-
-def normalize_goal(value: Any) -> GoalSelection:
-    raw = _raw_goal(value)
-    normalized_value = (
-        " ".join(raw.casefold().split())
-        if raw is not None
-        else ""
-    )
-    normalized = "unknown"
-    for goal, aliases in _GOAL_ALIASES.items():
-        if normalized_value in aliases:
-            normalized = goal
-            break
-    metric = _GOAL_METRICS.get(normalized)
-    return GoalSelection(
-        raw=raw,
-        normalized=normalized,
-        metric=metric,
-        supported=metric is not None,
-    )
-
-
 def normalize_post(row: Mapping[str, Any]) -> PostPerformance:
     metrics = _json_dict(row.get("metrics_json"))
     normalized = {
@@ -228,11 +138,11 @@ def normalize_post(row: Mapping[str, Any]) -> PostPerformance:
     engagement = None
     if all(
         normalized[metric] is not None
-        for metric in ENGAGEMENT_COMPONENTS
+        for metric in ENGAGEMENT_REQUIRED_COMPONENTS
     ):
         engagement = sum(
             normalized[metric] or 0
-            for metric in ENGAGEMENT_COMPONENTS
+            for metric in ENGAGEMENT_REQUIRED_COMPONENTS
         )
     views = normalized["views"]
     engagement_rate = None
@@ -352,34 +262,27 @@ def confidence_for(observations: Sequence[float]) -> tuple[float, float]:
     return _round(confidence), _round(dispersion)
 
 
-def _score_metric(
+def score_metric(
     post: PostPerformance,
     previous_posts: Sequence[PostPerformance],
-    goal: GoalSelection,
-) -> GoalScore:
-    if goal.metric is None:
-        return GoalScore(
-            goal=goal.normalized,
-            status="unsupported",
-        )
-    baseline = baseline_for(previous_posts, goal.metric)
-    post_value = metric_value(post, goal.metric)
+    metric: FeedbackMetric,
+) -> MetricScore:
+    baseline = baseline_for(previous_posts, metric)
+    post_value = metric_value(post, metric)
     if (
         post_value is None
         or baseline.value is None
         or baseline.value <= 0
     ):
-        return GoalScore(
-            goal=goal.normalized,
-            metric=goal.metric,
+        return MetricScore(
+            metric=metric,
             post_value=post_value,
             baseline_value=baseline.value,
             baseline_samples=baseline.samples,
             status="insufficient_data",
         )
-    return GoalScore(
-        goal=goal.normalized,
-        metric=goal.metric,
+    return MetricScore(
+        metric=metric,
         post_value=_round(post_value),
         baseline_value=baseline.value,
         baseline_samples=baseline.samples,
@@ -455,12 +358,9 @@ def rebuild_patterns(
     )
 
 
-def _source_signature(
-    goal: GoalSelection,
-    posts: Sequence[PostPerformance],
-) -> str:
+def _source_signature(posts: Sequence[PostPerformance]) -> str:
     source = {
-        "goal": goal.model_dump(mode="json"),
+        "projection_version": FEEDBACK_PROJECTION_VERSION,
         "posts": [
             post.model_dump(
                 mode="json",
@@ -519,31 +419,15 @@ class FeedbackLoop:
             for row in result.mappings().all()
         ]
 
-    async def _canonical_goal(self, user_id: int) -> str | None:
-        result = await self.session.execute(
-            _CANONICAL_GOAL_SQL,
-            {"uid": user_id},
-        )
-        row = result.mappings().first()
-        if row is None or int(row.get("account_count") or 0) != 1:
-            return None
-        return _raw_goal(row.get("goal"))
-
-    async def _resolve_goal(self, brain: BrainRecord) -> GoalSelection:
-        raw = _raw_goal(brain.goals.get("primary"))
-        if raw is None:
-            raw = _raw_goal(brain.goals.get("primary_goal"))
-        if raw is None:
-            raw = await self._canonical_goal(brain.user_id)
-        return normalize_goal(raw)
-
     def analyze_post(
         self,
         post: PostPerformance,
         previous_posts: Sequence[PostPerformance],
-        goal: GoalSelection,
-    ) -> GoalScore:
-        return _score_metric(post, previous_posts, goal)
+    ) -> dict[FeedbackMetric, MetricScore]:
+        return {
+            metric: score_metric(post, previous_posts, metric)
+            for metric in FEEDBACK_METRICS
+        }
 
     def rebuild_patterns(
         self,
@@ -551,16 +435,14 @@ class FeedbackLoop:
     ) -> list[PatternAggregate]:
         return rebuild_patterns(posts)
 
-    def _performance_summary(
+    def _metric_summary(
         self,
         posts: Sequence[PostPerformance],
-        goal: GoalSelection,
+        metric: FeedbackMetric,
         patterns: Sequence[PatternAggregate],
-        signature: str,
-        now: datetime,
-    ) -> tuple[dict[str, Any], str]:
+    ) -> dict[str, Any]:
         scores = [
-            self.analyze_post(post, posts[:index], goal)
+            score_metric(post, posts[:index], metric)
             for index, post in enumerate(posts)
         ]
         successful = [
@@ -568,29 +450,52 @@ class FeedbackLoop:
             for score in scores
             if score.status == "ok" and score.lift is not None
         ]
-        if not goal.supported:
-            status = "unsupported"
-        elif scores:
-            status = scores[-1].status
-        else:
-            status = "insufficient_data"
-
-        latest = scores[-1] if scores else GoalScore(
-            goal=goal.normalized,
-            metric=goal.metric,
-            status=(
-                "insufficient_data"
-                if goal.supported
-                else "unsupported"
-            ),
+        latest = scores[-1] if scores else MetricScore(
+            metric=metric,
+            status="insufficient_data",
         )
-        goal_summary = _without_none({
+        latest_summary = _without_none({
             "status": latest.status,
-            "metric": latest.metric,
             "post_value": latest.post_value,
             "baseline_value": latest.baseline_value,
             "baseline_samples": latest.baseline_samples,
             "lift": latest.lift,
+        })
+
+        metric_patterns = [
+            pattern
+            for pattern in patterns
+            if pattern.metric == metric
+        ]
+        mature = [
+            pattern
+            for pattern in metric_patterns
+            if pattern.samples >= PATTERN_MIN_SAMPLES
+            and pattern.confidence >= PATTERN_MIN_CONFIDENCE
+        ]
+        best_pattern = None
+        if mature:
+            best = max(
+                mature,
+                key=lambda pattern: (
+                    pattern.lift,
+                    pattern.confidence,
+                    pattern.samples,
+                    pattern.kind,
+                    pattern.key,
+                ),
+            )
+            best_pattern = {
+                "kind": best.kind,
+                "key": best.key,
+                "lift": best.lift,
+                "samples": best.samples,
+                "confidence": best.confidence,
+            }
+
+        return _without_none({
+            "status": latest.status,
+            "latest": latest_summary,
             "scored_posts": len(successful),
             "median_lift": (
                 _round(float(median(
@@ -600,54 +505,42 @@ class FeedbackLoop:
                 if successful
                 else None
             ),
+            "patterns": {
+                "total": len(metric_patterns),
+                "mature": len(mature),
+            },
+            "best_pattern": best_pattern,
         })
 
-        best_metrics: dict[str, dict[str, Any]] = {}
-        for metric in FEEDBACK_METRICS:
-            candidates = [
-                pattern
-                for pattern in patterns
-                if pattern.metric == metric
-                and pattern.samples >= PATTERN_MIN_SAMPLES
-                and pattern.confidence >= PATTERN_MIN_CONFIDENCE
-            ]
-            if not candidates:
-                continue
-            best = max(
-                candidates,
-                key=lambda pattern: (
-                    pattern.lift,
-                    pattern.confidence,
-                    pattern.samples,
-                    pattern.kind,
-                    pattern.key,
-                ),
+    def _performance_summary(
+        self,
+        posts: Sequence[PostPerformance],
+        patterns: Sequence[PatternAggregate],
+        signature: str,
+        now: datetime,
+    ) -> tuple[dict[str, Any], str]:
+        metrics = {
+            metric: self._metric_summary(posts, metric, patterns)
+            for metric in FEEDBACK_METRICS
+        }
+        status = (
+            "ok"
+            if any(
+                item["status"] == "ok"
+                for item in metrics.values()
             )
-            best_metrics[metric] = {
-                "kind": best.kind,
-                "key": best.key,
-                "lift": best.lift,
-                "samples": best.samples,
-                "confidence": best.confidence,
-            }
-
+            else "insufficient_data"
+        )
         mature_count = sum(
             pattern.samples >= PATTERN_MIN_SAMPLES
             and pattern.confidence >= PATTERN_MIN_CONFIDENCE
             for pattern in patterns
         )
-        baseline = _without_none({
-            "metric": latest.metric,
-            "value": latest.baseline_value,
-            "samples": latest.baseline_samples,
-        })
         summary = {
+            "projection_version": FEEDBACK_PROJECTION_VERSION,
             "status": status,
-            "goal": goal.model_dump(mode="json"),
-            "baseline": baseline if latest.metric is not None else None,
-            "goal_summary": goal_summary,
+            "metrics": metrics,
             "posts_analyzed": len(posts),
-            "best_metrics": best_metrics,
             "patterns": {
                 "total": len(patterns),
                 "mature": mature_count,
@@ -693,8 +586,7 @@ class FeedbackLoop:
             post.published_at,
             post.scheduled_post_id,
         ))
-        goal = await self._resolve_goal(brain)
-        signature = _source_signature(goal, posts)
+        signature = _source_signature(posts)
 
         previous = brain.performance.get("feedback_v1")
         if (
@@ -739,7 +631,6 @@ class FeedbackLoop:
             now = now.replace(tzinfo=timezone.utc)
         summary, status = self._performance_summary(
             posts,
-            goal,
             patterns,
             signature,
             now,
@@ -758,7 +649,6 @@ class FeedbackLoop:
             "feedback_rebuilt",
             payload={
                 "status": status,
-                "goal": goal.normalized,
                 "posts_analyzed": len(posts),
                 "patterns_written": len(patterns),
                 "source_signature": signature,

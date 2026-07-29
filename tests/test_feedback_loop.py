@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
+from app.core import threads_api
 from app.core.brain_repo import BrainNotFoundError, BrainRepo
 from app.core.context_builder import ContextBuilder
 from app.core.feedback_loop import (
@@ -10,10 +11,10 @@ from app.core.feedback_loop import (
     FeedbackLoop,
     baseline_for,
     confidence_for,
-    normalize_goal,
     normalize_post,
     rebuild_patterns,
 )
+from app.core.goal_metrics import normalize_goal
 from app.schemas.feedback import (
     AccountFeedbackResult,
     BrainPatternWrite,
@@ -200,6 +201,7 @@ class MemoryRepo:
         min_samples,
         min_confidence,
         limit,
+        metric=None,
     ):
         assert brain_id == self.brain.id
         return [
@@ -207,6 +209,7 @@ class MemoryRepo:
             for pattern in self.patterns
             if pattern.samples >= min_samples
             and pattern.confidence >= min_confidence
+            and (metric is None or pattern.metric == metric)
         ][:limit]
 
 
@@ -295,6 +298,21 @@ def test_repo_replaces_only_managed_pattern_projection():
     assert session.calls[3][1]["key"] == "short"
 
 
+def test_repo_can_filter_mature_patterns_by_metric():
+    session = QueueSession([[]])
+    patterns = asyncio.run(BrainRepo(session).get_patterns(
+        11,
+        min_samples=5,
+        min_confidence=0.70,
+        limit=12,
+        metric="engagement_rate",
+    ))
+    sql, params = session.calls[0]
+    assert patterns == []
+    assert "metric = :metric" in sql
+    assert params["metric"] == "engagement_rate"
+
+
 def test_cross_account_post_is_rejected():
     repo = MemoryRepo()
     loop = MemoryFeedbackLoop(
@@ -318,11 +336,11 @@ def test_baseline_excludes_current_post_and_uses_median():
     ]
     current = make_post(4, views=20)
     baseline = baseline_for(previous, "views")
-    score = FeedbackLoop(FakeSession()).analyze_post(
+    scores = FeedbackLoop(FakeSession()).analyze_post(
         current,
         previous,
-        normalize_goal("reach"),
     )
+    score = scores["views"]
     assert baseline.value == 10
     assert baseline.samples == 4
     assert score.baseline_value == 10
@@ -330,19 +348,18 @@ def test_baseline_excludes_current_post_and_uses_median():
     assert score.lift == 1
 
 
-def test_reach_goal_uses_views():
+def test_reach_dimension_uses_views():
     previous = [make_post(index, views=100) for index in range(3)]
     score = FeedbackLoop(FakeSession()).analyze_post(
         make_post(3, views=150),
         previous,
-        normalize_goal("охваты"),
-    )
+    )["views"]
     assert score.metric == "views"
     assert score.status == "ok"
     assert score.lift == 0.5
 
 
-def test_engagement_goal_uses_engagement_rate():
+def test_engagement_dimension_uses_engagement_rate():
     previous = [
         make_post(index, engagement_rate=0.1)
         for index in range(3)
@@ -350,11 +367,24 @@ def test_engagement_goal_uses_engagement_rate():
     score = FeedbackLoop(FakeSession()).analyze_post(
         make_post(3, engagement_rate=0.2),
         previous,
-        normalize_goal("вовлечение"),
-    )
+    )["engagement_rate"]
     assert score.metric == "engagement_rate"
     assert score.status == "ok"
     assert score.lift == 1
+
+
+def test_one_post_produces_all_supported_metric_scores():
+    previous = [
+        make_post(index, views=100, engagement_rate=0.1)
+        for index in range(3)
+    ]
+    scores = FeedbackLoop(FakeSession()).analyze_post(
+        make_post(3, views=150, engagement_rate=0.2),
+        previous,
+    )
+    assert set(scores) == {"views", "engagement_rate"}
+    assert scores["views"].lift == 0.5
+    assert scores["engagement_rate"].lift == 1
 
 
 @pytest.mark.parametrize(
@@ -365,30 +395,25 @@ def test_engagement_goal_uses_engagement_rate():
         ("лиды", "leads"),
     ],
 )
-def test_unavailable_goals_are_explicitly_unsupported(goal, normalized):
+def test_unavailable_goals_do_not_remove_supported_learning(
+    goal,
+    normalized,
+):
     selection = normalize_goal(goal)
-    score = FeedbackLoop(FakeSession()).analyze_post(
+    scores = FeedbackLoop(FakeSession()).analyze_post(
         make_post(3),
         [make_post(index) for index in range(3)],
-        selection,
     )
     assert selection.normalized == normalized
     assert selection.supported is False
-    assert score.status == "unsupported"
-    assert score.metric is None
+    assert selection.metric is None
+    assert set(scores) == {"views", "engagement_rate"}
 
 
-def test_canonical_goal_is_used_only_for_single_account():
-    single = FeedbackLoop(FakeSession([{
-        "account_count": 1,
-        "goal": "вовлечение",
-    }]))
-    multiple = FeedbackLoop(FakeSession([{
-        "account_count": 2,
-        "goal": "охваты",
-    }]))
-    assert asyncio.run(single._canonical_goal(7)) == "вовлечение"
-    assert asyncio.run(multiple._canonical_goal(7)) is None
+def test_goal_normalization_maps_only_supported_dimensions():
+    assert normalize_goal("охваты").metric == "views"
+    assert normalize_goal("вовлечение").metric == "engagement_rate"
+    assert normalize_goal("подписчики").metric is None
 
 
 def raw_post_row(metrics):
@@ -405,7 +430,53 @@ def raw_post_row(metrics):
     }
 
 
-def test_missing_engagement_metric_does_not_create_false_rate():
+def test_get_insights_preserves_omitted_metrics_as_missing(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "data": [
+                    {"name": "views", "values": [{"value": 100}]},
+                    {"name": "likes", "values": [{"value": 10}]},
+                    {"name": "replies", "values": [{"value": 1}]},
+                    {"name": "reposts", "values": [{"value": 1}]},
+                    {"name": "quotes", "values": [{"value": 0}]},
+                    {"name": "shares", "values": [{}]},
+                ]
+            }
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, params):
+            captured["url"] = url
+            captured["params"] = params
+            return Response()
+
+    monkeypatch.setattr(
+        threads_api.httpx,
+        "AsyncClient",
+        lambda **_kwargs: Client(),
+    )
+    metrics = asyncio.run(
+        threads_api.get_insights("token", "threads-1")
+    )
+    assert captured["params"]["metric"] == (
+        "views,likes,replies,reposts,quotes,shares"
+    )
+    assert metrics["quotes"] == 0
+    assert "shares" not in metrics
+
+
+def test_optional_shares_do_not_block_stable_engagement_subset():
     post = normalize_post(raw_post_row({
         "views": 100,
         "likes": 10,
@@ -415,6 +486,18 @@ def test_missing_engagement_metric_does_not_create_false_rate():
     }))
     assert post.views == 100
     assert post.shares is None
+    assert post.engagement == 12
+    assert post.engagement_rate == 0.12
+
+
+def test_missing_required_engagement_metric_remains_unknown():
+    post = normalize_post(raw_post_row({
+        "views": 100,
+        "likes": 10,
+        "replies": 1,
+        "reposts": 1,
+    }))
+    assert post.quotes is None
     assert post.engagement is None
     assert post.engagement_rate is None
 
@@ -428,7 +511,7 @@ def test_zero_views_does_not_divide_by_zero():
         "quotes": 0,
         "shares": 1,
     }))
-    assert post.engagement == 13
+    assert post.engagement == 12
     assert post.engagement_rate is None
 
 
@@ -494,7 +577,10 @@ def test_immature_patterns_are_not_promoted_to_best_metrics():
     ))
     feedback = repo.brain.performance["feedback_v1"]
     assert feedback["patterns"] == {"total": 6, "mature": 0}
-    assert feedback["best_metrics"] == {}
+    assert all(
+        "best_pattern" not in metric
+        for metric in feedback["metrics"].values()
+    )
 
 
 def test_feedback_rebuild_updates_performance_and_version_once():
@@ -515,11 +601,18 @@ def test_feedback_rebuild_updates_performance_and_version_once():
     assert result.brain_version == 2
     assert repo.brain.version == 2
     assert repo.brain.performance["rolling_30d"]["published_posts"] == 8
-    assert feedback["baseline"] == {
-        "metric": "views",
-        "value": 100.0,
-        "samples": 7,
+    assert feedback["projection_version"] == 2
+    assert "goal" not in feedback
+    assert feedback["metrics"]["views"]["latest"] == {
+        "status": "ok",
+        "post_value": 100.0,
+        "baseline_value": 100.0,
+        "baseline_samples": 7,
+        "lift": 0.0,
     }
+    assert feedback["metrics"]["engagement_rate"]["latest"][
+        "baseline_samples"
+    ] == 7
     assert feedback["patterns"] == {"total": 6, "mature": 6}
     assert repo.last_managed_kinds == MANAGED_PATTERN_KINDS
     assert len(writer.events) == 1
@@ -552,6 +645,55 @@ def test_feedback_rebuild_is_idempotent_for_same_source():
     assert len(writer.events) == 1
 
 
+def test_goal_change_does_not_rewrite_metric_history():
+    repo = MemoryRepo()
+    writer = MemoryWriter()
+    loop = MemoryFeedbackLoop(
+        repo,
+        {(7, 101): [make_post(index) for index in range(8)]},
+        writer,
+    )
+    asyncio.run(loop.analyze_account(
+        11,
+        user_id=7,
+        account_id=101,
+    ))
+    original_patterns = {
+        (pattern.kind, pattern.key, pattern.metric):
+        pattern.model_dump(exclude={"id", "updated_at"})
+        for pattern in repo.patterns
+    }
+    original_feedback = dict(
+        repo.brain.performance["feedback_v1"]
+    )
+
+    repo.brain = repo.brain.model_copy(update={
+        "goals": {"primary": "engagement"},
+        "version": repo.brain.version + 1,
+    })
+    second = asyncio.run(loop.analyze_account(
+        11,
+        user_id=7,
+        account_id=101,
+    ))
+    rebuilt_patterns = {
+        (pattern.kind, pattern.key, pattern.metric):
+        pattern.model_dump(exclude={"id", "updated_at"})
+        for pattern in repo.patterns
+    }
+
+    assert second.status == "no_new_data"
+    assert second.changed is False
+    assert repo.pattern_writes == 1
+    assert repo.update_calls == 1
+    assert rebuilt_patterns == original_patterns
+    assert repo.brain.performance["feedback_v1"] == original_feedback
+    assert {
+        metric
+        for _, _, metric in rebuilt_patterns
+    } == {"views", "engagement_rate"}
+
+
 def test_second_account_does_not_affect_first_account_feedback():
     repo = MemoryRepo()
     first_posts = [make_post(index, views=100) for index in range(4)]
@@ -578,7 +720,9 @@ def test_second_account_does_not_affect_first_account_feedback():
     ))
     feedback = repo.brain.performance["feedback_v1"]
     assert loop.loaded_scopes == [(7, 101)]
-    assert feedback["baseline"]["value"] == 100
+    assert feedback["metrics"]["views"]["latest"][
+        "baseline_value"
+    ] == 100
     assert feedback["posts_analyzed"] == 4
 
 
@@ -640,6 +784,62 @@ def test_context_builder_receives_only_mature_patterns():
     assert context.compact_dict()["patterns"] == [
         patterns[0].prompt_dict()
     ]
+
+
+@pytest.mark.parametrize(
+    "goal,expected_metric",
+    [
+        ("reach", "views"),
+        ("engagement", "engagement_rate"),
+        ("followers", None),
+    ],
+)
+def test_context_selects_patterns_for_current_supported_goal(
+    goal,
+    expected_metric,
+):
+    patterns = [
+        BrainPattern(
+            id=1,
+            brain_id=11,
+            kind="length_bucket",
+            key="short",
+            metric="views",
+            lift=0.2,
+            samples=5,
+            confidence=0.71,
+            updated_at=NOW,
+        ),
+        BrainPattern(
+            id=2,
+            brain_id=11,
+            kind="length_bucket",
+            key="short",
+            metric="engagement_rate",
+            lift=0.3,
+            samples=5,
+            confidence=0.72,
+            updated_at=NOW,
+        ),
+    ]
+    repo = MemoryRepo(
+        brain=make_brain(goals={"primary": goal}),
+        patterns=patterns,
+    )
+    context = asyncio.run(
+        ContextBuilder(repo).build_context(
+            11,
+            "generation",
+            1000,
+        )
+    ).compact_dict()
+    selected = context.get("patterns", [])
+    if expected_metric is None:
+        assert selected == []
+    else:
+        assert {pattern["metric"] for pattern in selected} == {
+            expected_metric
+        }
 
 
 def test_job_failure_for_one_account_does_not_stop_next(monkeypatch):

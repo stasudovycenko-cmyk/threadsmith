@@ -17,7 +17,6 @@ FeedbackMetric = Literal["views", "engagement_rate"]
 FeedbackStatus = Literal[
     "ok",
     "insufficient_data",
-    "unsupported",
     "no_new_data",
 ]
 
@@ -60,14 +59,13 @@ class PostBaseline(FeedbackModel):
     samples: int = Field(ge=0)
 
 
-class GoalScore(FeedbackModel):
-    goal: GoalName
-    metric: FeedbackMetric | None = None
+class MetricScore(FeedbackModel):
+    metric: FeedbackMetric
     post_value: float | None = None
     baseline_value: float | None = None
     baseline_samples: int = Field(default=0, ge=0)
     lift: float | None = None
-    status: Literal["ok", "insufficient_data", "unsupported"]
+    status: Literal["ok", "insufficient_data"]
 
 
 class PostFeature(FeedbackModel):

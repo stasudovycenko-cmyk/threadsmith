@@ -65,6 +65,8 @@ _BACKFILL_CONFIG_SQL = text("""
         un.created_at AS niche_created_at,
         ac.active AS autocontent_active,
         ac.posts_per_day,
+        ac.user_id AS autocontent_user_id,
+        ac.goal AS autocontent_goal,
         ac.created_at AS autocontent_created_at
     FROM threads_accounts account
     LEFT JOIN voice_profiles vp
@@ -512,6 +514,41 @@ class BrainWriter:
 
             autocontent_active = config.get("autocontent_active")
             posts_per_day = config.get("posts_per_day")
+            if config.get("autocontent_user_id") is not None:
+                goal_value = config.get("autocontent_goal")
+                goal = (
+                    str(goal_value).strip()
+                    if goal_value is not None
+                    else ""
+                )
+                canonical_goal = {
+                    "primary": goal or None,
+                }
+                fingerprint = _fingerprint(canonical_goal)
+                brain = await self._sync_section(
+                    brain,
+                    "goals",
+                    "autocontent_goal",
+                    canonical_goal,
+                    fingerprint,
+                )
+                await self.record_event(
+                    brain.id,
+                    "backfill_applied",
+                    payload={
+                        "section": "goals",
+                        "fields": ["primary"],
+                    },
+                    source_type="autocontent_settings",
+                    source_id=user_id,
+                    event_key=(
+                        f"backfill:autocontent_goal:{fingerprint}"
+                    ),
+                    occurred_at=_event_time(
+                        config.get("autocontent_created_at")
+                    ),
+                )
+
             if autocontent_active is not None or posts_per_day is not None:
                 autocontent = {
                     "autocontent": {

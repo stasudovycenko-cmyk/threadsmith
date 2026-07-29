@@ -175,6 +175,26 @@ _GET_PATTERNS_SQL = text("""
     LIMIT :pattern_limit
 """)
 
+_GET_PATTERNS_BY_METRIC_SQL = text("""
+    SELECT
+        id,
+        brain_id,
+        kind,
+        key,
+        metric,
+        lift,
+        samples,
+        confidence,
+        updated_at
+    FROM brain_patterns
+    WHERE brain_id = :brain_id
+      AND metric = :metric
+      AND samples >= :min_samples
+      AND confidence >= :min_confidence
+    ORDER BY confidence DESC, samples DESC, abs(lift) DESC, id
+    LIMIT :pattern_limit
+""")
+
 _GET_MANAGED_PATTERN_KEYS_SQL = text("""
     SELECT kind, key, metric
     FROM brain_patterns
@@ -372,15 +392,24 @@ class BrainRepo:
         min_samples: int,
         min_confidence: float,
         limit: int,
+        metric: str | None = None,
     ) -> list[BrainPattern]:
+        statement = (
+            _GET_PATTERNS_BY_METRIC_SQL
+            if metric is not None
+            else _GET_PATTERNS_SQL
+        )
+        params: dict[str, Any] = {
+            "brain_id": brain_id,
+            "min_samples": min_samples,
+            "min_confidence": min_confidence,
+            "pattern_limit": limit,
+        }
+        if metric is not None:
+            params["metric"] = metric
         result = await self.session.execute(
-            _GET_PATTERNS_SQL,
-            {
-                "brain_id": brain_id,
-                "min_samples": min_samples,
-                "min_confidence": min_confidence,
-                "pattern_limit": limit,
-            },
+            statement,
+            params,
         )
         return [
             BrainPattern.model_validate(dict(row))

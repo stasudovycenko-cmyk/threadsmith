@@ -117,7 +117,7 @@ def rich_brain(**overrides):
             "niche": "creator tools",
             "keywords": ["automation", "growth"],
         },
-        goals={"primary": "qualified growth"},
+        goals={"primary": "reach"},
         constraints={
             "critical": ["No fabricated claims"],
             "autocontent": {"active": True, "posts_per_day": 2},
@@ -139,7 +139,7 @@ def pattern_row(**overrides):
         "brain_id": 11,
         "kind": "hook",
         "key": "story",
-        "metric": "reach",
+        "metric": "views",
         "lift": 0.24,
         "samples": 12,
         "confidence": 0.88,
@@ -188,7 +188,12 @@ class MemoryRepo:
     async def get_patterns(self, brain_id, **kwargs):
         assert brain_id == self.brain.id
         self.pattern_args = kwargs
-        return self.patterns
+        metric = kwargs.get("metric")
+        return [
+            pattern
+            for pattern in self.patterns
+            if metric is None or pattern.metric == metric
+        ]
 
 
 class MemoryBrainWriter(BrainWriter):
@@ -235,6 +240,8 @@ def backfill_sources(account_count=1, **config_overrides):
         "niche_created_at": NOW,
         "autocontent_active": True,
         "posts_per_day": 2,
+        "autocontent_user_id": 7,
+        "autocontent_goal": "reach",
         "autocontent_created_at": NOW,
     }
     config.update(config_overrides)
@@ -382,7 +389,15 @@ def test_strategy_and_performance_are_aggregated():
     writer = MemoryBrainWriter(repo, backfill_sources())
     brain = asyncio.run(writer.apply_backfill(7, 101))
     assert updated.goals["primary"] == "growth"
+    assert brain.goals["primary"] == "growth"
     assert brain.performance["rolling_30d"]["published_posts"] == 3
+
+
+def test_single_account_canonical_goal_populates_brain():
+    repo = MemoryRepo(rich_brain(goals={}))
+    writer = MemoryBrainWriter(repo, backfill_sources())
+    brain = asyncio.run(writer.apply_backfill(7, 101))
+    assert brain.goals["primary"] == "reach"
 
 
 @pytest.mark.parametrize(
@@ -722,6 +737,7 @@ def test_pattern_thresholds_are_centralized():
         repo.pattern_args["min_confidence"]
         == PATTERN_MIN_CONFIDENCE
     )
+    assert repo.pattern_args["metric"] == "views"
 
 
 def test_brain_events_are_idempotent():
