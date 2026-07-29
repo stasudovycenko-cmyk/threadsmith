@@ -504,6 +504,7 @@ def test_postgres_reservation_locks_before_budget_check_and_insert():
     ("feature", "setting_name"),
     [
         ("autocontent", "AI_AUTOCONTENT_ENABLED"),
+        ("autocontent_repair", "AI_AUTOCONTENT_ENABLED"),
         ("neuro_comment", "AI_NEURO_ENABLED"),
         ("radar_analysis", "AI_RADAR_ENABLED"),
     ],

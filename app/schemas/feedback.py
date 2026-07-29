@@ -1,7 +1,7 @@
 """Typed boundaries for deterministic goal-aware feedback."""
 
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -51,6 +51,7 @@ class PostPerformance(FeedbackModel):
     engagement: int | None = Field(default=None, ge=0)
     engagement_rate: float | None = Field(default=None, ge=0)
     available_metrics: tuple[str, ...] = ()
+    content_metadata: dict[str, Any] | None = None
 
 
 class PostBaseline(FeedbackModel):

@@ -8,13 +8,22 @@
 """
 import json
 import logging
+from collections.abc import Sequence
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ai_cost import AIUsageContext
+from app.core.content_engine import (
+    ContentMemoryItem,
+    build_content_plan,
+    canonicalize_response,
+    memory_prompt,
+    quality_gate,
+)
 from app.core.context_builder import estimate_text_tokens
-from app.core.llm import LLM_MAX_TOKENS, ask_json
+from app.core.llm import LLMError, LLM_MAX_TOKENS, ask_json
+from app.schemas.content_engine import ContentGenerationResponse
 from app.schemas.llm import (
     PostGenerationResponse,
     ThreadGenerationResponse,
@@ -123,6 +132,19 @@ THREAD_SYSTEM_TMPL = """Ты - ghostwriter для Threads. Пишешь ветк
 
 Формат ответа JSON:
 {{"posts": ["текст поста 1", "текст поста 2", "..."]}}"""
+
+CONTENT_ENGINE_SYSTEM_SUFFIX = """
+
+CONTENT ENGINE 2.0:
+- Следуй brief; hints — предпочтения. Не повторяй memory, не выдумывай факты.
+- JSON: brief; hooks (ровно 3: type,text,intent); body; metadata; quality.
+- metadata: goal,angle,hook_type,format,topic,has_cta,cta_type,source,
+  selected_hook_index (0..2).
+- quality 0..1: clarity,hook_strength,specificity,voice_match,goal_fit."""
+
+
+class ContentQualityError(LLMError):
+    """The single generation and optional targeted repair both failed."""
 
 
 def _profile_str(profile: dict) -> str:
@@ -273,6 +295,99 @@ async def build_voice_profile(
     return profile
 
 
+def _legacy_generation_user(
+    topic: str,
+    *,
+    reference: str | None,
+    recent: Sequence[str],
+    goal: str | None,
+) -> str:
+    nl = "\n"
+    user = f"Тема поста: {topic}"
+    if goal:
+        user += f"{nl}{nl}ЦЕЛЬ ЭТОГО ПОСТА: {goal}"
+    if reference:
+        user += (
+            f"{nl}{nl}Пост-референс (укради механику, не текст):"
+            f"{nl}{reference}"
+        )
+    if recent:
+        separator = f"{nl}{nl}---{nl}{nl}"
+        user += (
+            f"{nl}{nl}МОИ ПОСЛЕДНИЕ ПОСТЫ. Запрещено повторять их "
+            "первые строки, структуру, формулировки и заходы. Нужен "
+            f"ДРУГОЙ тип хука и другая подача:{nl}{nl}"
+            + separator.join(recent)
+        )
+    return user
+
+
+def _content_generation_prompt(
+    *,
+    plan,
+    memory: Sequence[ContentMemoryItem],
+    reference: str | None,
+) -> str:
+    parts = [
+        "CONTENT_BRIEF_JSON:",
+        plan.brief.model_dump_json(exclude_none=True),
+        "RECENT_MEMORY_JSON:",
+        memory_prompt(memory),
+    ]
+    if reference:
+        parts.extend([
+            "REFERENCE_POST:",
+            reference[:1200],
+            "Используй механику reference, но не копируй текст.",
+        ])
+    parts.append(
+        "Создай один сильный пост и верни полный structured JSON."
+    )
+    return "\n".join(parts)
+
+
+def _targeted_repair_prompt(
+    *,
+    response: ContentGenerationResponse,
+    reasons: Sequence[str],
+    plan,
+    memory: Sequence[ContentMemoryItem],
+) -> str:
+    return "\n".join([
+        "Исправь draft только по перечисленным причинам.",
+        "QUALITY_GATE_FAILURES:",
+        json.dumps(list(reasons), ensure_ascii=False),
+        "CONTENT_BRIEF_JSON:",
+        plan.brief.model_dump_json(exclude_none=True),
+        "RECENT_MEMORY_JSON:",
+        memory_prompt(memory),
+        "ORIGINAL_DRAFT_JSON:",
+        response.model_dump_json(),
+        "Верни полный Content Engine JSON. Смысл и голос сохрани.",
+    ])
+
+
+def _public_content_result(
+    response: ContentGenerationResponse,
+    *,
+    quality_reasons: Sequence[str],
+) -> dict:
+    result = response.model_dump(mode="json")
+    index = response.metadata.selected_hook_index
+    selected = response.hooks[index]
+    result["selected_hook"] = {
+        "index": index,
+        "type": selected.type,
+        "text": selected.text,
+        "intent": selected.intent,
+    }
+    result["quality_gate"] = {
+        "passed": not quality_reasons,
+        "reasons": list(quality_reasons),
+    }
+    return result
+
+
 async def generate_post(
     profile: dict,
     topic: str,
@@ -283,49 +398,134 @@ async def generate_post(
     feature: str = "generate_post",
     brain: BrainTaskContext | None = None,
     usage_context: AIUsageContext | None = None,
+    memory: Sequence[ContentMemoryItem] | None = None,
+    source: str | None = None,
 ) -> dict:
-    """Тема или референс -> {hooks: [3 варианта], body}."""
-    nl = chr(10)
-
-    user = f"Тема поста: {topic}"
-
-    if goal:
-        user += nl + nl + "ЦЕЛЬ ЭТОГО ПОСТА: " + goal
-
-    if reference:
-        user += (
-            nl
-            + nl
-            + "Пост-референс (укради механику, не текст):"
-            + nl
-            + reference
+    """Build a brief, generate once, and repair once only if needed."""
+    memory_items = list(memory or ())
+    if not memory_items and recent:
+        memory_items = [
+            ContentMemoryItem(opening=opening)
+            for item in recent[:8]
+            if (opening := item.splitlines()[0].strip())
+        ]
+    content_source = source or (
+        "autocontent"
+        if feature == "autocontent"
+        else "reference" if reference else "manual"
+    )
+    plan = build_content_plan(
+        profile=profile,
+        topic=topic,
+        brain=brain,
+        memory=memory_items,
+        fallback_goal=goal,
+        source=content_source,
+    )
+    system = (
+        GEN_SYSTEM_TMPL.format(
+            profile=_profile_str(profile),
+            hooks=_HOOKS_TEXT,
         )
-
-    if recent:
-        sep = nl + nl + "---" + nl + nl
-        user += (
-            nl
-            + nl
-            + "МОИ ПОСЛЕДНИЕ ПОСТЫ. Запрещено повторять их первые "
-            + "строки, структуру, формулировки и заходы. Нужен ДРУГОЙ тип "
-            + "хука и другая подача:"
-            + nl
-            + nl
-            + sep.join(recent)
-        )
-
-    response = await ask_json(
-        _generation_system(profile, brain),
-        user,
-        max_tokens=LLM_MAX_TOKENS.get(
-            feature, LLM_MAX_TOKENS["generate_post"]
-        ),
-        response_model=PostGenerationResponse,
-        feature=feature,
-        usage_context=usage_context,
+        + CONTENT_ENGINE_SYSTEM_SUFFIX
+    )
+    user = _content_generation_prompt(
+        plan=plan,
+        memory=memory_items,
+        reference=reference,
+    )
+    legacy_user = _legacy_generation_user(
+        topic,
+        reference=reference,
+        recent=list(recent or ()),
+        goal=goal,
+    )
+    legacy_tokens = estimate_text_tokens(
+        _generation_system(profile, brain) + legacy_user
+    )
+    new_tokens = estimate_text_tokens(system + user)
+    delta_percent = (
+        round((new_tokens - legacy_tokens) / legacy_tokens * 100, 1)
+        if legacy_tokens
+        else 0.0
+    )
+    log.info(
+        "content_engine_prompt_sizes legacy_estimated_tokens=%s "
+        "new_estimated_tokens=%s delta_percent=%s brief_tokens=%s "
+        "memory_tokens=%s brain_tokens=%s",
+        legacy_tokens,
+        new_tokens,
+        delta_percent,
+        estimate_text_tokens(plan.brief.model_dump_json(exclude_none=True)),
+        estimate_text_tokens(memory_prompt(memory_items)),
+        brain.estimated_tokens if brain is not None else 0,
     )
 
-    return response.model_dump(mode="json")
+    generation_feature = (
+        "autocontent"
+        if feature == "autocontent"
+        else "content_generate"
+    )
+    response = await ask_json(
+        system,
+        user,
+        max_tokens=LLM_MAX_TOKENS[generation_feature],
+        response_model=ContentGenerationResponse,
+        feature=generation_feature,
+        usage_context=usage_context,
+    )
+    response = canonicalize_response(
+        response,
+        plan=plan,
+        usage_user_id=usage_context.user_id if usage_context else None,
+        usage_account_id=(
+            usage_context.threads_account_id if usage_context else None
+        ),
+        brain_version=getattr(brain, "brain_version", None),
+        pipeline_stage="generate",
+    )
+    gate = quality_gate(response, memory=memory_items)
+    if gate.passed:
+        return _public_content_result(response, quality_reasons=())
+
+    repair_feature = (
+        "autocontent_repair"
+        if feature == "autocontent"
+        else "content_repair"
+    )
+    repaired = await ask_json(
+        system,
+        _targeted_repair_prompt(
+            response=response,
+            reasons=gate.reasons,
+            plan=plan,
+            memory=memory_items,
+        ),
+        max_tokens=LLM_MAX_TOKENS[repair_feature],
+        response_model=ContentGenerationResponse,
+        feature=repair_feature,
+        usage_context=usage_context,
+    )
+    repaired = canonicalize_response(
+        repaired,
+        plan=plan,
+        usage_user_id=usage_context.user_id if usage_context else None,
+        usage_account_id=(
+            usage_context.threads_account_id if usage_context else None
+        ),
+        brain_version=getattr(brain, "brain_version", None),
+        pipeline_stage="repair",
+    )
+    repaired_gate = quality_gate(repaired, memory=memory_items)
+    if not repaired_gate.passed:
+        log.warning(
+            "content quality failed after one repair reasons=%s",
+            ",".join(repaired_gate.reasons),
+        )
+        raise ContentQualityError(
+            "Content quality gate failed after one repair"
+        )
+    return _public_content_result(repaired, quality_reasons=())
 
 
 async def rewrite_post(

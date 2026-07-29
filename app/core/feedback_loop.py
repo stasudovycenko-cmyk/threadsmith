@@ -61,10 +61,16 @@ CONFIDENCE_DISPERSION_SCALE = 0.5
 SHORT_POST_MAX_CHARS = 160
 MEDIUM_POST_MAX_CHARS = 320
 FLOAT_PRECISION = 6
-FEEDBACK_PROJECTION_VERSION = 2
+FEEDBACK_PROJECTION_VERSION = 3
 
 MANAGED_PATTERN_KINDS = (
+    "content_angle",
+    "content_format",
+    "content_source",
+    "cta_type",
     "has_link",
+    "has_cta",
+    "hook_type",
     "length_bucket",
     "publication_window_utc",
 )
@@ -77,6 +83,7 @@ _LOAD_POSTS_SQL = text("""
         post.threads_post_id,
         post.text,
         post.link,
+        post.content_metadata,
         post.run_at AS published_at,
         snapshot.snapshot_date,
         snapshot.metrics_json
@@ -171,6 +178,9 @@ def normalize_post(row: Mapping[str, Any]) -> PostPerformance:
         text=post_text,
         text_length=len(post_text),
         has_link=bool(str(row.get("link") or "").strip()),
+        content_metadata=(
+            _json_dict(row.get("content_metadata")) or None
+        ),
         **normalized,
         engagement=engagement,
         engagement_rate=(
@@ -203,7 +213,7 @@ def post_features(post: PostPerformance) -> tuple[PostFeature, ...]:
     else:
         window = "evening"
 
-    return (
+    features = [
         PostFeature(kind="length_bucket", key=length_key),
         PostFeature(
             kind="publication_window_utc",
@@ -213,7 +223,29 @@ def post_features(post: PostPerformance) -> tuple[PostFeature, ...]:
             kind="has_link",
             key="true" if post.has_link else "false",
         ),
-    )
+    ]
+    metadata = post.content_metadata or {}
+    metadata_features = {
+        "angle": "content_angle",
+        "format": "content_format",
+        "hook_type": "hook_type",
+        "cta_type": "cta_type",
+        "source": "content_source",
+    }
+    for field, kind in metadata_features.items():
+        value = metadata.get(field)
+        if isinstance(value, str) and value.strip():
+            features.append(PostFeature(
+                kind=kind,
+                key=value.strip().casefold()[:80],
+            ))
+    has_cta = metadata.get("has_cta")
+    if isinstance(has_cta, bool):
+        features.append(PostFeature(
+            kind="has_cta",
+            key="true" if has_cta else "false",
+        ))
+    return tuple(features)
 
 
 def metric_value(

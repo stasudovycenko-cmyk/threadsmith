@@ -18,7 +18,7 @@ from app.core.context_builder import (
     PATTERN_MIN_SAMPLES,
     ContextBuilder,
 )
-from app.schemas.llm import PostGenerationResponse
+from app.schemas.content_engine import ContentGenerationResponse
 from app.schemas.social_brain import (
     BrainPattern,
     BrainRecord,
@@ -270,13 +270,51 @@ def build_context(task="generation", budget=1000, repo=None):
 
 
 def llm_response():
-    return PostGenerationResponse(
+    return ContentGenerationResponse(
+        brief={
+            "goal": "reach",
+            "topic": "topic",
+            "angle": "observation",
+            "format": "observation",
+            "source": "manual",
+        },
         hooks=[
-            {"type": "insight", "text": "Hook"},
-            {"type": "pain", "text": "Hook 2"},
-            {"type": "number", "text": "Hook 3"},
+            {
+                "type": "insight",
+                "text": "Concrete opening",
+                "intent": "stop the reader",
+            },
+            {
+                "type": "pain",
+                "text": "A costly mistake",
+                "intent": "name the pain",
+            },
+            {
+                "type": "number",
+                "text": "Three useful signals",
+                "intent": "promise specifics",
+            },
         ],
-        body="Body",
+        body=(
+            "A concrete observation with enough detail to pass the "
+            "deterministic quality gate."
+        ),
+        metadata={
+            "goal": "reach",
+            "angle": "observation",
+            "hook_type": "insight",
+            "format": "observation",
+            "topic": "topic",
+            "has_cta": False,
+            "source": "manual",
+        },
+        quality={
+            "clarity": 0.8,
+            "hook_strength": 0.8,
+            "specificity": 0.8,
+            "voice_match": 0.8,
+            "goal_fit": 0.8,
+        },
     )
 
 
@@ -575,24 +613,28 @@ def test_scenarist_legacy_prompt_is_unchanged_without_brain(
 ):
     captured = {}
 
-    async def fake_ask_json(system, _user, **_kwargs):
+    async def fake_ask_json(system, user, **_kwargs):
         captured["system"] = system
+        captured["user"] = user
         return llm_response()
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     profile = {"tone": "direct", "taboo": ["fluff"]}
     asyncio.run(scenarist.generate_post(profile, "topic"))
-    assert captured["system"] == scenarist.GEN_SYSTEM_TMPL.format(
+    legacy_system = scenarist.GEN_SYSTEM_TMPL.format(
         profile=scenarist._profile_str(profile),
         hooks=scenarist._HOOKS_TEXT,
     )
+    assert captured["system"].startswith(legacy_system)
+    assert "CONTENT_BRIEF_JSON:" in captured["user"]
 
 
 def test_scenarist_adds_compact_brain_context(monkeypatch):
     captured = {}
 
-    async def fake_ask_json(system, _user, **_kwargs):
+    async def fake_ask_json(system, user, **_kwargs):
         captured["system"] = system
+        captured["user"] = user
         return llm_response()
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
@@ -602,20 +644,17 @@ def test_scenarist_adds_compact_brain_context(monkeypatch):
         "topic",
         brain=context,
     ))
-    supplemental = captured["system"].split(
-        "ДОПОЛНИТЕЛЬНЫЙ SOCIAL BRAIN CONTEXT",
-        1,
-    )[1]
-    assert '"niche":"creator tools"' in supplemental
-    assert "threads_account_id" not in supplemental
-    assert "created_at" not in supplemental
+    assert "creator tools" in captured["user"]
+    assert "threads_account_id" not in captured["user"]
+    assert "created_at" not in captured["user"]
 
 
 def test_scenarist_keeps_account_voice_facts(monkeypatch):
     captured = {}
 
-    async def fake_ask_json(system, _user, **_kwargs):
+    async def fake_ask_json(system, user, **_kwargs):
         captured["system"] = system
+        captured["user"] = user
         return llm_response()
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
@@ -625,11 +664,7 @@ def test_scenarist_keeps_account_voice_facts(monkeypatch):
         "topic",
         brain=context,
     ))
-    supplemental = captured["system"].split(
-        "ДОПОЛНИТЕЛЬНЫЙ SOCIAL BRAIN CONTEXT",
-        1,
-    )[1]
-    assert '"tone":"direct"' in supplemental
+    assert '\\"tone\\":\\"direct\\"' in captured["user"]
 
 
 def test_scenarist_uses_legacy_prompt_when_brain_fails(monkeypatch):
@@ -641,8 +676,9 @@ def test_scenarist_uses_legacy_prompt_when_brain_fails(monkeypatch):
         def compact_dict(self):
             raise RuntimeError("broken")
 
-    async def fake_ask_json(system, _user, **_kwargs):
+    async def fake_ask_json(system, user, **_kwargs):
         captured["system"] = system
+        captured["user"] = user
         return llm_response()
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
@@ -652,10 +688,12 @@ def test_scenarist_uses_legacy_prompt_when_brain_fails(monkeypatch):
         "topic",
         brain=BrokenBrain(),
     ))
-    assert captured["system"] == scenarist.GEN_SYSTEM_TMPL.format(
+    legacy_system = scenarist.GEN_SYSTEM_TMPL.format(
         profile=scenarist._profile_str(profile),
         hooks=scenarist._HOOKS_TEXT,
     )
+    assert captured["system"].startswith(legacy_system)
+    assert "CONTENT_BRIEF_JSON:" in captured["user"]
 
 
 def test_get_or_create_is_idempotent():
@@ -906,9 +944,12 @@ def test_scenarist_logs_prompt_sizes(monkeypatch, caplog):
             brain=build_context(),
         ))
     message = caplog.records[-1].getMessage()
-    assert "legacy_chars=" in message
-    assert "brain_chars=" in message
-    assert "final_chars=" in message
+    assert "legacy_estimated_tokens=" in message
+    assert "new_estimated_tokens=" in message
+    assert "delta_percent=" in message
+    assert "brief_tokens=" in message
+    assert "memory_tokens=" in message
+    assert "brain_tokens=" in message
 
 
 def test_publishing_event_only_after_success(monkeypatch):
