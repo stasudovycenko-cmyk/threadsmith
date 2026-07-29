@@ -35,6 +35,7 @@ def radar_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔥 Топ ниши", callback_data="rd:top")],
         [InlineKeyboardButton(text="🎯 Моя ниша", callback_data="rd:niche"),
          InlineKeyboardButton(text="📈 Мои посты", callback_data="rd:my")],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data="home")],
     ])
 
 

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from sqlalchemy import text
 
 from app.core.config import PLANS, settings
@@ -21,7 +21,7 @@ from app.core.credits import topup
 from app.core.crypto import encrypt_token
 from app.core.db import Session
 from app.core.robokassa import verify_result
-from app.core.threads_api import auth_link, exchange_code, get_me, to_long_lived
+from app.core.threads_api import exchange_code, get_me, to_long_lived
 
 log = logging.getLogger("api")
 app = FastAPI()
@@ -260,42 +260,3 @@ async def threadsmith_home():
     </body>
     </html>
     """)
-
-
-
-@app.get("/oauth/threads/start")
-async def threads_oauth_start(request: Request):
-    state = request.query_params.get("state")
-
-    if not state:
-        return HTMLResponse(
-            "<h3>Не передан state. Вернитесь в Telegram и попробуйте заново.</h3>",
-            status_code=400,
-        )
-
-    async with Session() as s:
-        row = (
-            await s.execute(
-                text("""
-                    SELECT 1
-                    FROM oauth_states
-                    WHERE state = :state
-                      AND created_at > now() - interval '30 minutes'
-                """),
-                {"state": state},
-            )
-        ).first()
-
-    if not row:
-        return HTMLResponse(
-            "<h3>Ссылка устарела. Вернитесь в Telegram и нажмите «Подключить» заново.</h3>",
-            status_code=400,
-        )
-
-    url = auth_link(state)
-    log.info("threads oauth start state=%s redirect=%s", state, url)
-
-    return RedirectResponse(url=url, status_code=302)
-
-from app.api.legal import router as legal_router
-app.include_router(legal_router)
