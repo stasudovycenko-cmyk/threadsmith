@@ -1,4 +1,4 @@
-"""Deterministic aggregation and persistence for Social Brain v1."""
+"""Account-aware aggregation and persistence for Social Brain v1."""
 
 import json
 from typing import Any
@@ -7,20 +7,26 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.social_brain import (
+    BrainAccountIdentity,
     BrainAudience,
     BrainConstraints,
     BrainContentPreferences,
     BrainFact,
     BrainGoals,
-    BrainIdentity,
     BrainMemory,
     BrainNiche,
     BrainPerformance,
     BrainStrategy,
+    BrainUserIdentity,
     BrainVoice,
     PerformanceMetrics,
     SocialBrainContext,
 )
+
+
+class SocialBrainAccountError(ValueError):
+    """The requested Threads account is missing or owned by another user."""
+
 
 _SENSITIVE_KEY_PARTS = (
     "access_token",
@@ -44,13 +50,13 @@ _SENSITIVE_KEY_PARTS = (
 _BASE_CONTEXT_SQL = text("""
     SELECT
         u.id AS user_id,
+        ta.id AS threads_account_id,
+        ta.username AS threads_username,
         (
-            SELECT ta.username
-            FROM threads_accounts ta
-            WHERE ta.user_id = u.id
-            ORDER BY ta.created_at DESC, ta.id DESC
-            LIMIT 1
-        ) AS threads_username,
+            SELECT count(*)
+            FROM threads_accounts owned
+            WHERE owned.user_id = u.id
+        ) AS account_count,
         vp.profile_json AS voice_profile_json,
         vp.updated_at AS voice_updated_at,
         un.niche,
@@ -66,16 +72,22 @@ _BASE_CONTEXT_SQL = text("""
         ns.mode AS neuro_mode,
         ns.daily_cap AS neuro_daily_cap
     FROM users u
+    JOIN threads_accounts ta
+      ON ta.user_id = u.id
+     AND ta.id = :account_id
     LEFT JOIN voice_profiles vp ON vp.user_id = u.id
     LEFT JOIN user_niches un ON un.user_id = u.id
-    LEFT JOIN user_strategy_state uss ON uss.user_id = u.id
+    LEFT JOIN user_strategy_state uss
+      ON uss.user_id = u.id
+     AND uss.threads_account_id = ta.id
     LEFT JOIN autocontent_settings ac ON ac.user_id = u.id
     LEFT JOIN neuro_settings ns ON ns.user_id = u.id
     WHERE u.id = :uid
 """)
 
 _FACTS_SQL = text("""
-    SELECT
+    SELECT DISTINCT ON (fact_type, fact_key)
+        threads_account_id,
         fact_type,
         fact_key,
         fact_value_json,
@@ -84,7 +96,16 @@ _FACTS_SQL = text("""
         updated_at
     FROM social_facts
     WHERE user_id = :uid
-    ORDER BY fact_type, confidence DESC, updated_at DESC, fact_key
+      AND (
+        threads_account_id IS NULL
+        OR threads_account_id = :account_id
+      )
+    ORDER BY
+        fact_type,
+        fact_key,
+        (threads_account_id IS NOT NULL) DESC,
+        confidence DESC,
+        updated_at DESC
 """)
 
 _PERFORMANCE_SQL = text("""
@@ -92,6 +113,7 @@ _PERFORMANCE_SQL = text("""
         SELECT status, threads_post_id
         FROM scheduled_posts
         WHERE user_id = :uid
+          AND threads_account_id = :account_id
           AND run_at >= now() - interval '30 days'
     ),
     latest_insights AS (
@@ -194,7 +216,7 @@ def _json_value(value: Any, default: Any) -> Any:
         try:
             return json.loads(value)
         except (TypeError, ValueError):
-            return default
+            return value
     return value
 
 
@@ -233,7 +255,10 @@ def _is_sensitive_key(key: Any) -> bool:
     return any(part in normalized for part in _SENSITIVE_KEY_PARTS)
 
 
-def _assert_no_sensitive_fields(value: Any, path: str = "value") -> None:
+def _assert_no_sensitive_fields(
+    value: Any,
+    path: str = "value",
+) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
             if _is_sensitive_key(key):
@@ -286,50 +311,149 @@ def _brain_fact(row: Any) -> BrainFact:
         value=_without_sensitive_fields(
             _json_value(row["fact_value_json"], None)
         ),
+        scope=(
+            "account"
+            if row["threads_account_id"] is not None
+            else "global"
+        ),
         confidence=float(row["confidence"]),
         source=str(row["source"]),
         updated_at=row["updated_at"],
     )
 
 
-def _empty_context(user_id: int) -> SocialBrainContext:
-    return SocialBrainContext(
-        identity=BrainIdentity(user_id=user_id, exists=False)
+def _apply_voice_profile_fact(
+    voice: BrainVoice,
+    facts: list[BrainFact],
+) -> None:
+    profile_fact = next(
+        (
+            fact
+            for fact in facts
+            if fact.key == "profile"
+            and isinstance(fact.value, dict)
+        ),
+        None,
     )
+    if profile_fact is None:
+        return
+
+    profile = _without_sensitive_fields(profile_fact.value)
+    list_fields = ("lexicon", "taboo", "sample_phrases")
+    text_fields = (
+        "sentence_length",
+        "punctuation",
+        "tone",
+        "structure",
+    )
+    for field in list_fields:
+        if field in profile:
+            setattr(voice, field, _string_list(profile[field]))
+    for field in text_fields:
+        if field in profile:
+            setattr(voice, field, _optional_text(profile[field]))
+    voice.available = True
+    voice.updated_at = profile_fact.updated_at
+
+
+def _apply_niche_fact(
+    name: str | None,
+    keywords: list[str],
+    facts: list[BrainFact],
+) -> tuple[str | None, list[str]]:
+    niche_fact = next(
+        (fact for fact in facts if fact.key == "niche"),
+        None,
+    )
+    if niche_fact is None:
+        return name, keywords
+    if isinstance(niche_fact.value, str):
+        return _optional_text(niche_fact.value), keywords
+    if not isinstance(niche_fact.value, dict):
+        return name, keywords
+
+    value = _without_sensitive_fields(niche_fact.value)
+    if "name" in value:
+        name = _optional_text(value["name"])
+    if "keywords" in value:
+        keywords = _string_list(value["keywords"])
+    return name, keywords
+
+
+def _stored_generation_mix(
+    facts: list[BrainFact],
+) -> dict[str, int]:
+    fact = next(
+        (
+            item
+            for item in facts
+            if item.key == "generation_mix_30d"
+            and isinstance(item.value, dict)
+        ),
+        None,
+    )
+    if fact is None:
+        return {}
+    raw_mix = fact.value.get("by_type")
+    if not isinstance(raw_mix, dict):
+        return {}
+    return {
+        str(key): _as_int(value)
+        for key, value in raw_mix.items()
+    }
 
 
 async def build_brain_context(
     session: AsyncSession,
     user_id: int,
+    threads_account_id: int,
 ) -> SocialBrainContext:
-    """Build a user context from SQL and stored facts without an LLM call."""
-    params = {"uid": user_id}
+    """Build one owned account context without an LLM call."""
+    params = {
+        "uid": user_id,
+        "account_id": threads_account_id,
+    }
     base_result = await session.execute(_BASE_CONTEXT_SQL, params)
     base = base_result.mappings().first()
     if base is None:
-        return _empty_context(user_id)
+        raise SocialBrainAccountError(
+            f"Threads account {threads_account_id} is not owned by "
+            f"user {user_id}"
+        )
+
+    account_count = _as_int(base["account_count"])
+    uses_user_defaults = account_count == 1
 
     facts_result = await session.execute(_FACTS_SQL, params)
     facts = [_brain_fact(row) for row in facts_result.mappings().all()]
 
     performance_result = await session.execute(
-        _PERFORMANCE_SQL, params
+        _PERFORMANCE_SQL,
+        params,
     )
     performance_row = performance_result.mappings().first() or {}
 
-    generation_result = await session.execute(
-        _GENERATION_MIX_SQL, params
-    )
-    generation_mix = {
-        str(row["generation_type"]): _as_int(row["generation_count"])
-        for row in generation_result.mappings().all()
-    }
-
-    neuro_result = await session.execute(_NEURO_STATUS_SQL, params)
-    neuro_status = {
-        str(row["status"]): _as_int(row["status_count"])
-        for row in neuro_result.mappings().all()
-    }
+    generation_mix: dict[str, int] = {}
+    neuro_status: dict[str, int] = {}
+    if uses_user_defaults:
+        generation_result = await session.execute(
+            _GENERATION_MIX_SQL,
+            params,
+        )
+        generation_mix = {
+            str(row["generation_type"]): _as_int(
+                row["generation_count"]
+            )
+            for row in generation_result.mappings().all()
+        }
+        neuro_result = await session.execute(
+            _NEURO_STATUS_SQL,
+            params,
+        )
+        neuro_status = {
+            str(row["status"]): _as_int(row["status_count"])
+            for row in neuro_result.mappings().all()
+        }
 
     voice_facts: list[BrainFact] = []
     audience_facts: list[BrainFact] = []
@@ -351,10 +475,38 @@ async def build_brain_context(
         fact_targets.get(fact.fact_type, memory_facts).append(fact)
 
     voice = _profile_voice(
-        base["voice_profile_json"],
-        base["voice_updated_at"],
+        (
+            base["voice_profile_json"]
+            if uses_user_defaults
+            else None
+        ),
+        (
+            base["voice_updated_at"]
+            if uses_user_defaults
+            else None
+        ),
     )
     voice.facts = voice_facts
+    _apply_voice_profile_fact(voice, voice_facts)
+
+    niche_name = (
+        _optional_text(base["niche"])
+        if uses_user_defaults
+        else None
+    )
+    niche_keywords = (
+        _string_list(base["niche_keywords"])
+        if uses_user_defaults
+        else []
+    )
+    niche_name, niche_keywords = _apply_niche_fact(
+        niche_name,
+        niche_keywords,
+        topic_facts,
+    )
+
+    if not generation_mix:
+        generation_mix = _stored_generation_mix(content_facts)
 
     insight_posts = _as_int(
         performance_row.get("insight_posts_30d")
@@ -374,17 +526,18 @@ async def build_brain_context(
         _json_dict(base["strategy_json"])
     )
     return SocialBrainContext(
-        identity=BrainIdentity(
-            user_id=user_id,
-            exists=True,
+        user=BrainUserIdentity(user_id=user_id),
+        account=BrainAccountIdentity(
+            threads_account_id=threads_account_id,
             threads_username=_optional_text(
                 base["threads_username"]
             ),
+            uses_user_defaults=uses_user_defaults,
         ),
         voice=voice,
         niche=BrainNiche(
-            name=_optional_text(base["niche"]),
-            keywords=_string_list(base["niche_keywords"]),
+            name=niche_name,
+            keywords=niche_keywords,
             topic_facts=topic_facts,
         ),
         goals=BrainGoals(
@@ -393,16 +546,36 @@ async def build_brain_context(
         ),
         audience=BrainAudience(facts=audience_facts),
         content_preferences=BrainContentPreferences(
-            autocontent_active=base["autocontent_active"],
-            posts_per_day=base["posts_per_day"],
+            autocontent_active=(
+                base["autocontent_active"]
+                if uses_user_defaults
+                else None
+            ),
+            posts_per_day=(
+                base["posts_per_day"]
+                if uses_user_defaults
+                else None
+            ),
             generation_mix_30d=generation_mix,
             facts=content_facts,
         ),
         constraints=BrainConstraints(
             voice_taboo=voice.taboo,
-            neuro_active=base["neuro_active"],
-            neuro_mode=_optional_text(base["neuro_mode"]),
-            neuro_daily_cap=base["neuro_daily_cap"],
+            neuro_active=(
+                base["neuro_active"]
+                if uses_user_defaults
+                else None
+            ),
+            neuro_mode=(
+                _optional_text(base["neuro_mode"])
+                if uses_user_defaults
+                else None
+            ),
+            neuro_daily_cap=(
+                base["neuro_daily_cap"]
+                if uses_user_defaults
+                else None
+            ),
             facts=constraint_facts,
         ),
         performance=BrainPerformance(
@@ -434,13 +607,14 @@ async def upsert_social_fact(
     session: AsyncSession,
     user_id: int,
     *,
+    threads_account_id: int | None,
     fact_type: str,
     key: str,
     value: Any,
     source: str,
     confidence: float = 1.0,
 ) -> None:
-    """Upsert one atomic fact; the caller owns the transaction."""
+    """Upsert one global or owned account fact."""
     for metadata in (fact_type, key, source):
         if not str(metadata).strip():
             raise ValueError("Social Brain fact metadata cannot be empty")
@@ -457,54 +631,107 @@ async def upsert_social_fact(
         separators=(",", ":"),
         allow_nan=False,
     )
-    await session.execute(text("""
-        INSERT INTO social_facts (
-            user_id,
-            fact_type,
-            fact_key,
-            fact_value_json,
-            confidence,
-            source,
-            created_at,
-            updated_at
-        )
-        VALUES (
-            :uid,
-            :fact_type,
-            :fact_key,
-            CAST(:fact_value AS jsonb),
-            :confidence,
-            :source,
-            now(),
-            now()
-        )
-        ON CONFLICT ON CONSTRAINT
-            social_facts_user_type_key_unique
-        DO UPDATE SET
-            fact_value_json = EXCLUDED.fact_value_json,
-            confidence = EXCLUDED.confidence,
-            source = EXCLUDED.source,
-            updated_at = now()
-    """), {
+    params = {
         "uid": user_id,
+        "account_id": threads_account_id,
         "fact_type": fact_type.strip(),
         "fact_key": key.strip(),
         "fact_value": serialized,
         "confidence": confidence,
         "source": source.strip(),
-    })
+    }
+
+    if threads_account_id is None:
+        result = await session.execute(text("""
+            INSERT INTO social_facts (
+                user_id,
+                threads_account_id,
+                fact_type,
+                fact_key,
+                fact_value_json,
+                confidence,
+                source,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                :uid,
+                NULL,
+                :fact_type,
+                :fact_key,
+                CAST(:fact_value AS jsonb),
+                :confidence,
+                :source,
+                now(),
+                now()
+            )
+            ON CONFLICT (user_id, fact_type, fact_key)
+              WHERE threads_account_id IS NULL
+            DO UPDATE SET
+                fact_value_json = EXCLUDED.fact_value_json,
+                confidence = EXCLUDED.confidence,
+                source = EXCLUDED.source,
+                updated_at = now()
+            RETURNING id
+        """), params)
+    else:
+        result = await session.execute(text("""
+            INSERT INTO social_facts (
+                user_id,
+                threads_account_id,
+                fact_type,
+                fact_key,
+                fact_value_json,
+                confidence,
+                source,
+                created_at,
+                updated_at
+            )
+            SELECT
+                :uid,
+                :account_id,
+                :fact_type,
+                :fact_key,
+                CAST(:fact_value AS jsonb),
+                :confidence,
+                :source,
+                now(),
+                now()
+            FROM threads_accounts account
+            WHERE account.id = :account_id
+              AND account.user_id = :uid
+            ON CONFLICT (
+                user_id,
+                threads_account_id,
+                fact_type,
+                fact_key
+            )
+              WHERE threads_account_id IS NOT NULL
+            DO UPDATE SET
+                fact_value_json = EXCLUDED.fact_value_json,
+                confidence = EXCLUDED.confidence,
+                source = EXCLUDED.source,
+                updated_at = now()
+            RETURNING id
+        """), params)
+        if result.first() is None:
+            raise SocialBrainAccountError(
+                f"Threads account {threads_account_id} is not owned by "
+                f"user {user_id}"
+            )
 
 
 async def upsert_strategy_state(
     session: AsyncSession,
     user_id: int,
+    threads_account_id: int,
     *,
     primary_goal: str | None = None,
     secondary_goal: str | None = None,
     strategy: dict[str, Any] | None = None,
     autonomy_level: str | None = None,
 ) -> None:
-    """Persist explicit strategy state; the caller owns the transaction."""
+    """Persist strategy for one owned account."""
     strategy = strategy or {}
     _assert_no_sensitive_fields(strategy, "strategy")
     serialized = json.dumps(
@@ -513,9 +740,10 @@ async def upsert_strategy_state(
         separators=(",", ":"),
         allow_nan=False,
     )
-    await session.execute(text("""
+    result = await session.execute(text("""
         INSERT INTO user_strategy_state (
             user_id,
+            threads_account_id,
             primary_goal,
             secondary_goal,
             strategy_json,
@@ -523,44 +751,58 @@ async def upsert_strategy_state(
             created_at,
             updated_at
         )
-        VALUES (
+        SELECT
             :uid,
+            :account_id,
             :primary_goal,
             :secondary_goal,
             CAST(:strategy AS jsonb),
             :autonomy_level,
             now(),
             now()
-        )
-        ON CONFLICT (user_id) DO UPDATE SET
+        FROM threads_accounts account
+        WHERE account.id = :account_id
+          AND account.user_id = :uid
+        ON CONFLICT (user_id, threads_account_id) DO UPDATE SET
             primary_goal = EXCLUDED.primary_goal,
             secondary_goal = EXCLUDED.secondary_goal,
             strategy_json = EXCLUDED.strategy_json,
             autonomy_level = EXCLUDED.autonomy_level,
             updated_at = now()
+        RETURNING threads_account_id
     """), {
         "uid": user_id,
+        "account_id": threads_account_id,
         "primary_goal": primary_goal,
         "secondary_goal": secondary_goal,
         "strategy": serialized,
         "autonomy_level": autonomy_level,
     })
+    if result.first() is None:
+        raise SocialBrainAccountError(
+            f"Threads account {threads_account_id} is not owned by "
+            f"user {user_id}"
+        )
 
 
 async def initialize_brain_from_existing_data(
     session: AsyncSession,
     user_id: int,
+    threads_account_id: int,
 ) -> SocialBrainContext:
-    """Persist deterministic 30-day summaries and return a fresh context."""
-    brain = await build_brain_context(session, user_id)
-    if not brain.identity.exists:
-        return brain
+    """Persist deterministic account summaries and return fresh context."""
+    brain = await build_brain_context(
+        session,
+        user_id,
+        threads_account_id,
+    )
 
     mix = brain.content_preferences.generation_mix_30d
     if mix:
         await upsert_social_fact(
             session,
             user_id,
+            threads_account_id=threads_account_id,
             fact_type="content_pattern",
             key="generation_mix_30d",
             value={"window_days": 30, "by_type": mix},
@@ -579,6 +821,7 @@ async def initialize_brain_from_existing_data(
         await upsert_social_fact(
             session,
             user_id,
+            threads_account_id=threads_account_id,
             fact_type="performance",
             key="rolling_30d",
             value={
@@ -597,4 +840,8 @@ async def initialize_brain_from_existing_data(
             source="initial_deterministic_build",
         )
 
-    return await build_brain_context(session, user_id)
+    return await build_brain_context(
+        session,
+        user_id,
+        threads_account_id,
+    )

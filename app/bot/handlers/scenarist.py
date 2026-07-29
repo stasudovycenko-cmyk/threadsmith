@@ -75,10 +75,26 @@ async def _require_voice(cb: CallbackQuery, uid: int) -> dict | None:
     return profile
 
 
-async def _load_brain(uid: int):
+async def _single_account_id(uid: int) -> int | None:
+    async with Session() as s:
+        rows = (await s.execute(text("""
+            SELECT id
+            FROM threads_accounts
+            WHERE user_id = :uid
+            ORDER BY id
+            LIMIT 2
+        """), {"uid": uid})).all()
+    return rows[0][0] if len(rows) == 1 else None
+
+
+async def _load_brain(uid: int, threads_account_id: int):
     try:
         async with Session() as s:
-            return await social_brain.build_brain_context(s, uid)
+            return await social_brain.build_brain_context(
+                s,
+                uid,
+                threads_account_id,
+            )
     except Exception as exc:
         log.warning(
             "Social Brain unavailable uid=%s error_type=%s; "
@@ -267,7 +283,8 @@ async def cb_more(cb: CallbackQuery):
 # ---------- общий раннер ----------
 
 async def _run_generation(msg: Message, gen_type: str, inp: dict,
-                          override_user_tg: int | None = None):
+                          override_user_tg: int | None = None,
+                          threads_account_id: int | None = None):
     tg_id = override_user_tg or msg.from_user.id
     uid = await _uid(tg_id)
     cost = CREDIT_COSTS[gen_type]
@@ -284,7 +301,16 @@ async def _run_generation(msg: Message, gen_type: str, inp: dict,
     await msg.answer("Пишу...")
     try:
         if gen_type == "generate_post":
-            brain = await _load_brain(uid)
+            account_id = (
+                threads_account_id
+                if threads_account_id is not None
+                else await _single_account_id(uid)
+            )
+            brain = (
+                await _load_brain(uid, account_id)
+                if account_id is not None
+                else None
+            )
             out = await scenarist.generate_post(
                 profile,
                 inp["topic"],

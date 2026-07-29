@@ -2,7 +2,7 @@
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -57,6 +57,7 @@ class BrainFact(CompactContext):
     fact_type: str
     key: str
     value: Any
+    scope: Literal["global", "account"]
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     source: str
     updated_at: datetime | None = None
@@ -85,10 +86,14 @@ def _task_facts(facts: list[BrainFact]) -> list[TaskFact]:
     ]
 
 
-class BrainIdentity(CompactContext):
+class BrainUserIdentity(CompactContext):
     user_id: int
-    exists: bool = False
+
+
+class BrainAccountIdentity(CompactContext):
+    threads_account_id: int
     threads_username: str | None = None
+    uses_user_defaults: bool = False
 
 
 class BrainVoice(CompactContext):
@@ -242,7 +247,8 @@ class AutocontentBrainContext(CompactContext):
 
 
 class SocialBrainContext(CompactContext):
-    identity: BrainIdentity
+    user: BrainUserIdentity
+    account: BrainAccountIdentity
     voice: BrainVoice = Field(default_factory=BrainVoice)
     niche: BrainNiche = Field(default_factory=BrainNiche)
     goals: BrainGoals = Field(default_factory=BrainGoals)
@@ -266,7 +272,11 @@ class SocialBrainContext(CompactContext):
             structure=self.voice.structure,
             taboo=self.voice.taboo,
             sample_phrases=self.voice.sample_phrases,
-            facts=_task_facts(self.voice.facts),
+            facts=_task_facts([
+                fact
+                for fact in self.voice.facts
+                if fact.key != "profile"
+            ]),
         )
 
     def _niche_for_task(self) -> TaskNiche | None:
@@ -378,7 +388,11 @@ class SocialBrainContext(CompactContext):
             niche=self._niche_for_task(),
             goals=self._goals_for_task(),
             audience=_task_facts(self.audience.facts),
-            topics=_task_facts(self.niche.topic_facts),
+            topics=_task_facts([
+                fact
+                for fact in self.niche.topic_facts
+                if fact.key != "niche"
+            ]),
             performance=self._performance_for_task(),
         )
 

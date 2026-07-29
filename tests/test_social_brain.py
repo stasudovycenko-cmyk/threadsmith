@@ -5,17 +5,19 @@ from datetime import datetime, timezone
 import pytest
 
 from app.core import llm, scenarist, social_brain
+from app.bot.handlers import scenarist as scenarist_handler
 from app.schemas.llm import PostGenerationResponse
 from app.schemas.social_brain import (
+    BrainAccountIdentity,
     BrainAudience,
     BrainConstraints,
     BrainContentPreferences,
     BrainFact,
     BrainGoals,
-    BrainIdentity,
     BrainNiche,
     BrainPerformance,
     BrainStrategy,
+    BrainUserIdentity,
     BrainVoice,
     PerformanceMetrics,
     SocialBrainContext,
@@ -48,10 +50,23 @@ class FakeSession:
         return FakeResult(self.responses.pop(0))
 
 
+class FakeSessionContext:
+    def __init__(self, session):
+        self.session = session
+
+    async def __aenter__(self):
+        return self.session
+
+    async def __aexit__(self, *_args):
+        return None
+
+
 def base_row(**overrides):
     row = {
         "user_id": 7,
+        "threads_account_id": 101,
         "threads_username": None,
+        "account_count": 1,
         "voice_profile_json": None,
         "voice_updated_at": None,
         "niche": None,
@@ -105,18 +120,40 @@ def context_responses(
     ]
 
 
+def fact_row(
+    fact_type,
+    key,
+    value,
+    *,
+    threads_account_id=None,
+    confidence=1.0,
+):
+    return {
+        "threads_account_id": threads_account_id,
+        "fact_type": fact_type,
+        "fact_key": key,
+        "fact_value_json": value,
+        "confidence": confidence,
+        "source": "test",
+        "updated_at": datetime(
+            2026,
+            7,
+            2,
+            tzinfo=timezone.utc,
+        ),
+    }
+
+
 def test_empty_brain_for_unknown_user():
     session = FakeSession([[]])
 
-    brain = asyncio.run(
-        social_brain.build_brain_context(session, 404)
-    )
-
-    assert brain.identity == BrainIdentity(
-        user_id=404, exists=False
-    )
-    assert brain.voice.available is False
-    assert brain.for_generation().compact_dict() == {}
+    with pytest.raises(
+        social_brain.SocialBrainAccountError,
+        match="not owned",
+    ):
+        asyncio.run(
+            social_brain.build_brain_context(session, 404, 999)
+        )
     assert len(session.calls) == 1
 
 
@@ -137,7 +174,7 @@ def test_brain_from_existing_voice_profile():
     )))
 
     brain = asyncio.run(
-        social_brain.build_brain_context(session, 7)
+        social_brain.build_brain_context(session, 7, 101)
     )
 
     assert brain.voice.available is True
@@ -154,18 +191,234 @@ def test_brain_combines_voice_and_niche():
     )))
 
     brain = asyncio.run(
-        social_brain.build_brain_context(session, 7)
+        social_brain.build_brain_context(session, 7, 101)
     )
 
     assert brain.voice.tone == "calm"
     assert brain.niche.name == "SaaS"
     assert brain.niche.keywords == ["retention", "activation"]
+    assert brain.account.uses_user_defaults is True
+
+
+def test_two_accounts_have_isolated_brains_and_global_facts():
+    global_fact = fact_row(
+        "audience",
+        "shared_goal",
+        "learn faster",
+    )
+    facts_a = [
+        global_fact,
+        fact_row(
+            "voice",
+            "profile",
+            {"tone": "bold", "taboo": ["hedging"]},
+            threads_account_id=101,
+        ),
+        fact_row(
+            "topic",
+            "niche",
+            {"name": "SaaS", "keywords": ["retention"]},
+            threads_account_id=101,
+        ),
+        fact_row(
+            "performance",
+            "winning_pattern",
+            "numbers",
+            threads_account_id=101,
+        ),
+    ]
+    facts_b = [
+        global_fact,
+        fact_row(
+            "voice",
+            "profile",
+            {"tone": "calm", "taboo": ["hype"]},
+            threads_account_id=202,
+        ),
+        fact_row(
+            "topic",
+            "niche",
+            {"name": "Fitness", "keywords": ["mobility"]},
+            threads_account_id=202,
+        ),
+        fact_row(
+            "performance",
+            "winning_pattern",
+            "stories",
+            threads_account_id=202,
+        ),
+    ]
+    session_a = FakeSession([
+        [base_row(
+            threads_account_id=101,
+            threads_username="account_a",
+            account_count=2,
+            voice_profile_json={"tone": "ambiguous"},
+            niche="ambiguous",
+            primary_goal="grow SaaS founders",
+            strategy_json={"cadence": "daily"},
+            autonomy_level="assist",
+        )],
+        facts_a,
+        [performance_row(
+            total_posts_30d=4,
+            published_posts_30d=3,
+            insight_posts_30d=2,
+            views=900,
+        )],
+    ])
+    session_b = FakeSession([
+        [base_row(
+            threads_account_id=202,
+            threads_username="account_b",
+            account_count=2,
+            voice_profile_json={"tone": "ambiguous"},
+            niche="ambiguous",
+            primary_goal="grow fitness audience",
+            strategy_json={"cadence": "weekly"},
+            autonomy_level="manual",
+        )],
+        facts_b,
+        [performance_row(
+            total_posts_30d=2,
+            published_posts_30d=2,
+            insight_posts_30d=1,
+            views=300,
+        )],
+    ])
+
+    brain_a = asyncio.run(
+        social_brain.build_brain_context(
+            session_a,
+            7,
+            101,
+        )
+    )
+    brain_b = asyncio.run(
+        social_brain.build_brain_context(
+            session_b,
+            7,
+            202,
+        )
+    )
+
+    assert brain_a.voice.tone == "bold"
+    assert brain_b.voice.tone == "calm"
+    assert brain_a.niche.name == "SaaS"
+    assert brain_b.niche.name == "Fitness"
+    assert brain_a.goals.primary == "grow SaaS founders"
+    assert brain_b.goals.primary == "grow fitness audience"
+    assert brain_a.strategy.values == {"cadence": "daily"}
+    assert brain_b.strategy.values == {"cadence": "weekly"}
+    assert brain_a.performance.metrics_30d.views == 900
+    assert brain_b.performance.metrics_30d.views == 300
+    assert brain_a.performance.facts[0].value == "numbers"
+    assert brain_b.performance.facts[0].value == "stories"
+    assert brain_a.audience.facts[0].scope == "global"
+    assert brain_b.audience.facts[0].scope == "global"
+    assert "stories" not in brain_a.compact_json()
+    assert "numbers" not in brain_b.compact_json()
+    assert brain_a.account.uses_user_defaults is False
+    assert brain_b.account.uses_user_defaults is False
+    assert len(session_a.calls) == 3
+    assert len(session_b.calls) == 3
+    for _, params in session_a.calls:
+        assert params["account_id"] == 101
+    for _, params in session_b.calls:
+        assert params["account_id"] == 202
+
+
+def test_multi_account_brain_omits_ambiguous_user_defaults():
+    session = FakeSession([
+        [base_row(
+            account_count=2,
+            voice_profile_json={"tone": "ambiguous"},
+            niche="ambiguous",
+            niche_keywords=["ambiguous"],
+            autocontent_active=True,
+            posts_per_day=3,
+            neuro_active=True,
+            neuro_mode="auto",
+            neuro_daily_cap=10,
+        )],
+        [],
+        [performance_row()],
+    ])
+
+    brain = asyncio.run(
+        social_brain.build_brain_context(session, 7, 101)
+    )
+
+    assert brain.voice.available is False
+    assert brain.niche.name is None
+    assert brain.niche.keywords == []
+    assert brain.content_preferences.autocontent_active is None
+    assert brain.content_preferences.posts_per_day is None
+    assert brain.constraints.neuro_active is None
+    assert brain.performance.generated_30d == 0
+    assert len(session.calls) == 3
+
+
+def test_account_fact_overrides_same_key_global_fact():
+    session = FakeSession([
+        [base_row(account_count=2)],
+        [
+            fact_row(
+                "audience",
+                "preferred_offer",
+                "account-specific",
+                threads_account_id=101,
+            )
+        ],
+        [performance_row()],
+    ])
+
+    brain = asyncio.run(
+        social_brain.build_brain_context(session, 7, 101)
+    )
+
+    assert brain.audience.facts[0].value == "account-specific"
+    facts_sql, params = session.calls[1]
+    assert "(threads_account_id IS NOT NULL) DESC" in facts_sql
+    assert "threads_account_id = :account_id" in facts_sql
+    assert params["account_id"] == 101
+
+
+def test_wrong_account_ownership_is_rejected():
+    build_session = FakeSession([[]])
+    fact_session = FakeSession([[]])
+    strategy_session = FakeSession([[]])
+
+    with pytest.raises(social_brain.SocialBrainAccountError):
+        asyncio.run(social_brain.build_brain_context(
+            build_session,
+            7,
+            202,
+        ))
+    with pytest.raises(social_brain.SocialBrainAccountError):
+        asyncio.run(social_brain.upsert_social_fact(
+            fact_session,
+            7,
+            threads_account_id=202,
+            fact_type="audience",
+            key="pain",
+            value="wrong owner",
+            source="test",
+        ))
+    with pytest.raises(social_brain.SocialBrainAccountError):
+        asyncio.run(social_brain.upsert_strategy_state(
+            strategy_session,
+            7,
+            202,
+            strategy={"cadence": "daily"},
+        ))
 
 
 def test_social_facts_are_routed_and_sensitive_keys_are_filtered():
     timestamp = datetime(2026, 7, 2, tzinfo=timezone.utc)
     facts = [
         {
+            "threads_account_id": 101,
             "fact_type": fact_type,
             "fact_key": f"{fact_type}_key",
             "fact_value_json": {
@@ -195,7 +448,7 @@ def test_social_facts_are_routed_and_sensitive_keys_are_filtered():
     ))
 
     brain = asyncio.run(
-        social_brain.build_brain_context(session, 7)
+        social_brain.build_brain_context(session, 7, 101)
     )
 
     assert len(brain.voice.facts) == 1
@@ -250,7 +503,7 @@ def test_strategy_and_performance_are_aggregated():
     ))
 
     brain = asyncio.run(
-        social_brain.build_brain_context(session, 7)
+        social_brain.build_brain_context(session, 7, 101)
     )
 
     assert brain.goals.primary == "grow qualified audience"
@@ -271,19 +524,20 @@ def test_strategy_and_performance_are_aggregated():
     }
 
 
-def rich_brain():
+def rich_brain(threads_account_id=101):
     fact = BrainFact(
         fact_type="audience",
         key="pain",
         value="slow content production",
+        scope="account",
         confidence=0.9,
         source="manual",
         updated_at=datetime(2026, 7, 4, tzinfo=timezone.utc),
     )
     return SocialBrainContext(
-        identity=BrainIdentity(
-            user_id=7,
-            exists=True,
+        user=BrainUserIdentity(user_id=7),
+        account=BrainAccountIdentity(
+            threads_account_id=threads_account_id,
             threads_username="author",
         ),
         voice=BrainVoice(
@@ -382,6 +636,8 @@ def test_task_specific_contexts_are_compact_and_scoped():
     for context in (generation, radar, neuro, autocontent):
         serialized = json.dumps(context)
         assert "user_id" not in serialized
+        assert "threads_account_id" not in serialized
+        assert "scope" not in serialized
         assert "source" not in serialized
         assert "updated_at" not in serialized
 
@@ -409,6 +665,7 @@ def test_task_context_limits_long_term_facts():
             fact_type="audience",
             key=f"fact_{index}",
             value=index,
+            scope="account",
             confidence=index / 20,
             source="test",
         )
@@ -430,11 +687,11 @@ def test_build_brain_context_does_not_call_llm(monkeypatch):
     session = FakeSession(context_responses(base_row()))
 
     brain = asyncio.run(
-        social_brain.build_brain_context(session, 7)
+        social_brain.build_brain_context(session, 7, 101)
     )
 
     assert "ask_json" not in vars(social_brain)
-    assert brain.identity.exists is True
+    assert brain.account.threads_account_id == 101
     assert len(session.calls) == 5
 
 
@@ -442,7 +699,8 @@ def test_initial_brain_update_upserts_deterministic_summaries(
     monkeypatch,
 ):
     initial = SocialBrainContext(
-        identity=BrainIdentity(user_id=7, exists=True),
+        user=BrainUserIdentity(user_id=7),
+        account=BrainAccountIdentity(threads_account_id=101),
         content_preferences=BrainContentPreferences(
             generation_mix_30d={"generate_post": 4}
         ),
@@ -458,7 +716,7 @@ def test_initial_brain_update_upserts_deterministic_summaries(
     builds = [initial, refreshed]
     upserts = []
 
-    async def fake_build(_session, _user_id):
+    async def fake_build(_session, _user_id, _account_id):
         return builds.pop(0)
 
     async def fake_upsert(_session, user_id, **kwargs):
@@ -473,7 +731,7 @@ def test_initial_brain_update_upserts_deterministic_summaries(
 
     result = asyncio.run(
         social_brain.initialize_brain_from_existing_data(
-            FakeSession(), 7
+            FakeSession(), 7, 101
         )
     )
 
@@ -482,11 +740,46 @@ def test_initial_brain_update_upserts_deterministic_summaries(
         "generation_mix_30d",
         "rolling_30d",
     ]
+    assert all(
+        item[1]["threads_account_id"] == 101
+        for item in upserts
+    )
     assert upserts[0][1]["value"] == {
         "window_days": 30,
         "by_type": {"generate_post": 4},
     }
     assert upserts[1][1]["value"]["metrics"]["views"] == 500
+
+
+def test_fact_upserts_match_partial_unique_scopes():
+    global_session = FakeSession([[(1,)]])
+    account_session = FakeSession([[(2,)]])
+
+    asyncio.run(social_brain.upsert_social_fact(
+        global_session,
+        7,
+        threads_account_id=None,
+        fact_type="audience",
+        key="pain",
+        value="shared",
+        source="test",
+    ))
+    asyncio.run(social_brain.upsert_social_fact(
+        account_session,
+        7,
+        threads_account_id=101,
+        fact_type="audience",
+        key="pain",
+        value="account",
+        source="test",
+    ))
+
+    global_sql, global_params = global_session.calls[0]
+    account_sql, account_params = account_session.calls[0]
+    assert "WHERE threads_account_id IS NULL" in global_sql
+    assert "WHERE threads_account_id IS NOT NULL" in account_sql
+    assert global_params["account_id"] is None
+    assert account_params["account_id"] == 101
 
 
 def test_sensitive_fields_cannot_be_persisted():
@@ -496,6 +789,7 @@ def test_sensitive_fields_cannot_be_persisted():
         asyncio.run(social_brain.upsert_social_fact(
             session,
             7,
+            threads_account_id=101,
             fact_type="business",
             key="integration",
             value={"nested": {"access_token": "secret"}},
@@ -506,10 +800,95 @@ def test_sensitive_fields_cannot_be_persisted():
         asyncio.run(social_brain.upsert_strategy_state(
             session,
             7,
+            101,
             strategy={"oauth_secret": "secret"},
         ))
 
     assert session.calls == []
+
+
+def test_scenarist_loads_brain_for_selected_account(monkeypatch):
+    captured = {}
+    expected = rich_brain(threads_account_id=202)
+
+    async def fake_build(session, user_id, account_id):
+        captured.update(
+            session=session,
+            user_id=user_id,
+            account_id=account_id,
+        )
+        return expected
+
+    session = FakeSession()
+    monkeypatch.setattr(
+        scenarist_handler,
+        "Session",
+        lambda: FakeSessionContext(session),
+    )
+    monkeypatch.setattr(
+        scenarist_handler.social_brain,
+        "build_brain_context",
+        fake_build,
+    )
+
+    result = asyncio.run(
+        scenarist_handler._load_brain(7, 202)
+    )
+
+    assert result is expected
+    assert captured == {
+        "session": session,
+        "user_id": 7,
+        "account_id": 202,
+    }
+
+
+def test_scenarist_falls_back_when_selected_account_is_invalid(
+    monkeypatch,
+):
+    async def fake_build(*_args):
+        raise social_brain.SocialBrainAccountError("not owned")
+
+    monkeypatch.setattr(
+        scenarist_handler,
+        "Session",
+        lambda: FakeSessionContext(FakeSession()),
+    )
+    monkeypatch.setattr(
+        scenarist_handler.social_brain,
+        "build_brain_context",
+        fake_build,
+    )
+
+    result = asyncio.run(
+        scenarist_handler._load_brain(7, 202)
+    )
+
+    assert result is None
+
+
+def test_scenarist_infers_only_unambiguous_single_account(
+    monkeypatch,
+):
+    sessions = iter([
+        FakeSession([[(101,)]]),
+        FakeSession([[(101,), (202,)]]),
+    ])
+    monkeypatch.setattr(
+        scenarist_handler,
+        "Session",
+        lambda: FakeSessionContext(next(sessions)),
+    )
+
+    single = asyncio.run(
+        scenarist_handler._single_account_id(7)
+    )
+    ambiguous = asyncio.run(
+        scenarist_handler._single_account_id(7)
+    )
+
+    assert single == 101
+    assert ambiguous is None
 
 
 def test_scenarist_legacy_prompt_is_unchanged_without_brain(
@@ -576,6 +955,49 @@ def test_scenarist_adds_compact_brain_context(monkeypatch):
     )[1]
     assert "source" not in system
     assert "updated_at" not in system
+    assert "threads_account_id" not in system
+
+
+def test_scenarist_keeps_account_voice_facts(monkeypatch):
+    captured = {}
+
+    async def fake_ask_json(system, _user, **_kwargs):
+        captured["system"] = system
+        return PostGenerationResponse(
+            hooks=[
+                {"type": "insight", "text": "Hook"},
+                {"type": "pain", "text": "Hook 2"},
+                {"type": "number", "text": "Hook 3"},
+            ],
+            body="Body",
+        )
+
+    monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
+    brain = rich_brain(threads_account_id=202)
+    brain.voice.tone = "account-specific"
+    brain.voice.facts = [
+        BrainFact(
+            fact_type="voice",
+            key="profile",
+            value={"tone": "account-specific"},
+            scope="account",
+            source="test",
+        )
+    ]
+
+    asyncio.run(scenarist.generate_post(
+        {"tone": "legacy"},
+        "topic",
+        brain=brain,
+    ))
+
+    supplemental = captured["system"].split(
+        "ДОПОЛНИТЕЛЬНЫЙ SOCIAL BRAIN CONTEXT",
+        1,
+    )[1]
+    assert '"voice":{' in supplemental
+    assert '"tone":"account-specific"' in supplemental
+    assert "threads_account_id" not in supplemental
 
 
 def test_scenarist_uses_legacy_prompt_when_brain_fails(monkeypatch):
