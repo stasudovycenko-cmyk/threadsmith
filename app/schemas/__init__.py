@@ -9,6 +9,16 @@ from app.schemas.llm import (
     ThreadGenerationResponse,
     VoiceProfileResponse,
 )
+from app.schemas.feedback import (
+    AccountFeedbackResult,
+    BrainPatternWrite,
+    GoalScore,
+    GoalSelection,
+    PatternAggregate,
+    PostBaseline,
+    PostFeature,
+    PostPerformance,
+)
 from app.schemas.social_brain import (
     BrainEvent,
     BrainPattern,
@@ -24,6 +34,14 @@ __all__ = [
     "RadarAnalysisResponse",
     "ThreadGenerationResponse",
     "VoiceProfileResponse",
+    "AccountFeedbackResult",
+    "BrainPatternWrite",
+    "GoalScore",
+    "GoalSelection",
+    "PatternAggregate",
+    "PostBaseline",
+    "PostFeature",
+    "PostPerformance",
     "BrainEvent",
     "BrainPattern",
     "BrainRecord",
