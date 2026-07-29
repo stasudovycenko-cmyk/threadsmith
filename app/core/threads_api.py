@@ -49,9 +49,14 @@ def _safe_response_error(response: httpx.Response) -> ThreadsAPIError:
 
 
 def _raise_for_status_safe(response: httpx.Response) -> None:
-    if response.is_error:
-        raise _safe_response_error(response)
+    is_error = getattr(response, "is_error", None)
 
+    if is_error is None:
+        response.raise_for_status()
+        return
+
+    if is_error:
+        raise _safe_response_error(response)
 
 def auth_link(state: str) -> str:
     params = {
