@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.ai_cost import AIUsageContext
 from app.core.llm import LLM_MAX_TOKENS, ask_json
 from app.schemas.llm import NeuroCommentResponse
 
@@ -48,8 +49,14 @@ JSON:
 _LINK_RE = re.compile(r"(https?://|t\.me/|@[\w.]+|www\.)", re.I)
 
 
-async def generate_comment(profile: dict, niche: str,
-                           post_text: str, author: str) -> dict:
+async def generate_comment(
+    profile: dict,
+    niche: str,
+    post_text: str,
+    author: str,
+    *,
+    usage_context: AIUsageContext | None = None,
+) -> dict:
     response = await ask_json(
         NEURO_SYSTEM_TMPL.format(
             profile=json.dumps(
@@ -61,6 +68,7 @@ async def generate_comment(profile: dict, niche: str,
         max_tokens=LLM_MAX_TOKENS["neuro_comment"],
         response_model=NeuroCommentResponse,
         feature="neuro_comment",
+        usage_context=usage_context,
     )
     result = response.model_dump(mode="json")
     # постфильтр: LLM сказали без ссылок, но доверяй и проверяй

@@ -1,12 +1,21 @@
 import asyncio
 import json
 import logging
+import uuid
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel, ConfigDict
 
-from app.core import llm
+from app.core import ai_cost, llm
+from app.core.ai_cost import (
+    AICostEngine,
+    BudgetExceeded,
+    TokenUsage,
+    UsageReservation,
+    calculate_cost_usd,
+)
 
 
 class SampleResponse(BaseModel):
@@ -37,6 +46,58 @@ class FakeMessages:
 class FakeClient:
     def __init__(self, responses):
         self.messages = FakeMessages(responses)
+
+
+class FakeCostEngine:
+    def __init__(self):
+        self.reservations = []
+        self.completions = []
+
+    async def reserve_call(self, **kwargs):
+        self.reservations.append(kwargs)
+        request_id = kwargs.get("request_id") or uuid.uuid4()
+        return UsageReservation(
+            event_key=f"{request_id}:{kwargs['attempt']}",
+            request_id=request_id,
+            feature=kwargs["feature"],
+            model=kwargs["model"],
+            attempt=kwargs["attempt"],
+            user_id=kwargs["context"].user_id,
+            threads_account_id=kwargs["context"].threads_account_id,
+            run_id=kwargs["context"].run_id,
+            reserved_cost_usd=Decimal("0.01"),
+        )
+
+    async def complete_call(
+        self,
+        reservation,
+        *,
+        usage: TokenUsage,
+        status,
+        latency_ms,
+        failure_type=None,
+    ):
+        self.completions.append({
+            "reservation": reservation,
+            "usage": usage,
+            "status": status,
+            "latency_ms": latency_ms,
+            "failure_type": failure_type,
+        })
+        return calculate_cost_usd(
+            reservation.model,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_creation_tokens=usage.cache_creation_tokens,
+        )
+
+
+@pytest.fixture(autouse=True)
+def fake_cost_accounting(monkeypatch):
+    engine = FakeCostEngine()
+    monkeypatch.setattr(llm, "cost_engine", engine)
+    return engine
 
 
 def run_ask(monkeypatch, responses, *, typed=True, feature="test"):
@@ -212,21 +273,33 @@ def test_usage_is_extracted_into_structured_log(monkeypatch, caplog):
         )
 
     events = usage_events(caplog)
-    assert events == [
-        {
-            "event": "llm_call",
-            "feature": "usage_test",
-            "model": llm.MODEL,
-            "input_tokens": 321,
-            "output_tokens": 45,
-            "cache_read_tokens": 120,
-            "cache_creation_tokens": 30,
-            "latency_ms": events[0]["latency_ms"],
-            "attempt": 1,
-            "status": "success",
-            "max_tokens": llm.DEFAULT_MAX_TOKENS,
-        }
-    ]
+    event = events[0]
+    assert {
+        "event": event["event"],
+        "feature": event["feature"],
+        "model": event["model"],
+        "input_tokens": event["input_tokens"],
+        "output_tokens": event["output_tokens"],
+        "cache_read_tokens": event["cache_read_tokens"],
+        "cache_creation_tokens": event["cache_creation_tokens"],
+        "attempt": event["attempt"],
+        "status": event["status"],
+        "max_tokens": event["max_tokens"],
+        "scope": event["scope"],
+    } == {
+        "event": "llm_call",
+        "feature": "usage_test",
+        "model": llm.MODEL,
+        "input_tokens": 321,
+        "output_tokens": 45,
+        "cache_read_tokens": 120,
+        "cache_creation_tokens": 30,
+        "attempt": 1,
+        "status": "success",
+        "max_tokens": llm.DEFAULT_MAX_TOKENS,
+        "scope": "system",
+    }
+    assert Decimal(event["estimated_cost_usd"]) > 0
     assert events[0]["latency_ms"] >= 0
 
 
@@ -276,3 +349,64 @@ def test_default_max_tokens_remains_backwards_compatible(
 
     assert fake.messages.calls[0]["max_tokens"] == 2000
     assert usage_events(caplog)[0]["max_tokens"] == 2000
+
+
+def test_budget_exhausted_during_repair_stops_before_second_provider_call(
+    monkeypatch,
+):
+    class RepairBudgetEngine(FakeCostEngine):
+        async def reserve_call(self, **kwargs):
+            if kwargs["attempt"] == 2:
+                raise BudgetExceeded(
+                    "user_daily_cost",
+                    scope="user:7",
+                    current=Decimal("1"),
+                    limit=Decimal("1"),
+                )
+            return await super().reserve_call(**kwargs)
+
+    fake_client = FakeClient(['{"title": "missing count"}'])
+    monkeypatch.setattr(llm, "client", fake_client)
+    monkeypatch.setattr(llm, "cost_engine", RepairBudgetEngine())
+
+    with pytest.raises(llm.LLMGuardError, match="user_daily_cost"):
+        asyncio.run(llm.ask_json(
+            "system",
+            "user",
+            response_model=SampleResponse,
+            feature="generate_post",
+        ))
+
+    assert len(fake_client.messages.calls) == 1
+
+
+def test_kill_switch_precheck_never_calls_provider_or_logs_prompt(
+    monkeypatch,
+    caplog,
+):
+    secret_prompt = "private-prompt-content"
+    fake_client = FakeClient([])
+
+    class ForbiddenStore:
+        async def reserve(self, *_args, **_kwargs):
+            raise AssertionError("store should not run behind kill switch")
+
+    monkeypatch.setattr(ai_cost.settings, "AI_ENABLED", False)
+    monkeypatch.setattr(llm, "client", fake_client)
+    monkeypatch.setattr(
+        llm,
+        "cost_engine",
+        AICostEngine(ForbiddenStore()),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(llm.LLMGuardError, match="kill_switch"):
+            asyncio.run(llm.ask_json(
+                "system",
+                secret_prompt,
+                response_model=SampleResponse,
+                feature="generate_post",
+            ))
+
+    assert fake_client.messages.calls == []
+    assert secret_prompt not in caplog.text

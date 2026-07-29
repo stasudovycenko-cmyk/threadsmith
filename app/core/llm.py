@@ -9,16 +9,28 @@
 import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import TypeVar, overload
 
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel, ValidationError
 
+from app.core.ai_cost import (
+    AI_MAX_REPAIR_PER_REQUEST,
+    AI_MAX_TRANSPORT_RETRIES,
+    AICostEngine,
+    AICostGuardError,
+    AIUsageContext,
+    TokenUsage,
+    UsageReservation,
+)
 from app.core.config import settings
 
 log = logging.getLogger("llm")
 client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
+cost_engine = AICostEngine()
 
 MODEL = "claude-sonnet-4-6"  # sonnet: качество/цена ок для генерации постов
 DEFAULT_MAX_TOKENS = 2000
@@ -43,11 +55,16 @@ class LLMError(Exception):
     pass
 
 
+class LLMGuardError(LLMError):
+    """A controlled budget, anomaly, idempotency, or kill-switch stop."""
+
+
 @dataclass(frozen=True)
 class _CallResult:
     raw: str
     usage: object | None
     latency_ms: int
+    reservation: UsageReservation
 
 
 def _extract_json(raw: str) -> dict | list:
@@ -79,6 +96,9 @@ def _log_call(
     status: str,
     latency_ms: int,
     usage: object | None,
+    context: AIUsageContext,
+    request_id: uuid.UUID,
+    cost_usd: Decimal,
     failure_type: str | None = None,
 ) -> None:
     event = {
@@ -93,6 +113,16 @@ def _log_call(
         "cache_creation_tokens": _usage_value(
             usage, "cache_creation_input_tokens"
         ),
+        "estimated_cost_usd": str(cost_usd),
+        "user_id": context.user_id,
+        "threads_account_id": context.threads_account_id,
+        "scope": (
+            "attributed"
+            if context.user_id is not None
+            or context.threads_account_id is not None
+            else "system"
+        ),
+        "request_id": str(request_id),
         "latency_ms": latency_ms,
         "attempt": attempt,
         "status": status,
@@ -113,7 +143,24 @@ async def _request(
     *,
     feature: str,
     attempt: int,
+    context: AIUsageContext,
+    request_id: uuid.UUID,
 ) -> _CallResult:
+    try:
+        reservation = await cost_engine.reserve_call(
+            feature=feature,
+            model=MODEL,
+            max_tokens=max_tokens,
+            prompt_chars=len(system) + len(user) + len(_JSON_INSTRUCTION),
+            attempt=attempt,
+            context=context,
+            request_id=request_id,
+        )
+    except AICostGuardError as error:
+        raise LLMGuardError(
+            f"AI request blocked: {error.reason} ({error.scope})"
+        ) from error
+
     started_at = time.perf_counter()
     resp = None
     try:
@@ -126,13 +173,35 @@ async def _request(
         raw = resp.content[0].text
     except Exception as error:
         latency_ms = round((time.perf_counter() - started_at) * 1000)
+        usage = getattr(resp, "usage", None)
+        token_usage = _token_usage(usage)
+        try:
+            cost_usd = await cost_engine.complete_call(
+                reservation,
+                usage=token_usage,
+                status="failure",
+                latency_ms=latency_ms,
+                failure_type=type(error).__name__,
+            )
+        except Exception as accounting_error:
+            log.exception(
+                "ai usage finalization failed feature=%s attempt=%s",
+                feature,
+                attempt,
+            )
+            raise LLMGuardError(
+                "AI usage accounting failed after provider error"
+            ) from accounting_error
         _log_call(
             feature=feature,
             max_tokens=max_tokens,
             attempt=attempt,
             status="failure",
             latency_ms=latency_ms,
-            usage=getattr(resp, "usage", None),
+            usage=usage,
+            context=context,
+            request_id=request_id,
+            cost_usd=cost_usd,
             failure_type=type(error).__name__,
         )
         raise
@@ -140,6 +209,7 @@ async def _request(
         raw=raw,
         usage=getattr(resp, "usage", None),
         latency_ms=round((time.perf_counter() - started_at) * 1000),
+        reservation=reservation,
     )
 
 
@@ -172,65 +242,119 @@ def _repair_prompt(raw: str, error: Exception) -> str:
     )
 
 
-def _parse_call(
+def _token_usage(usage: object | None) -> TokenUsage:
+    return TokenUsage(
+        input_tokens=_usage_value(usage, "input_tokens"),
+        output_tokens=_usage_value(usage, "output_tokens"),
+        cache_read_tokens=_usage_value(
+            usage, "cache_read_input_tokens"
+        ),
+        cache_creation_tokens=_usage_value(
+            usage, "cache_creation_input_tokens"
+        ),
+    )
+
+
+async def _finalize_call(
     call: _CallResult,
     *,
     feature: str,
     max_tokens: int,
     attempt: int,
-) -> dict | list:
+    context: AIUsageContext,
+    status: str,
+    failure_type: str | None = None,
+) -> None:
     try:
-        result = _extract_json(call.raw)
-    except Exception as error:
-        _log_call(
-            feature=feature,
-            max_tokens=max_tokens,
-            attempt=attempt,
-            status="failure",
+        cost_usd = await cost_engine.complete_call(
+            call.reservation,
+            usage=_token_usage(call.usage),
+            status=status,
             latency_ms=call.latency_ms,
-            usage=call.usage,
-            failure_type=type(error).__name__,
+            failure_type=failure_type,
         )
-        raise
+    except Exception as error:
+        log.exception(
+            "ai usage finalization failed feature=%s attempt=%s",
+            feature,
+            attempt,
+        )
+        raise LLMGuardError("AI usage accounting failed") from error
     _log_call(
         feature=feature,
         max_tokens=max_tokens,
         attempt=attempt,
-        status="success",
+        status=status,
         latency_ms=call.latency_ms,
         usage=call.usage,
+        context=context,
+        request_id=call.reservation.request_id,
+        cost_usd=cost_usd,
+        failure_type=failure_type,
+    )
+
+
+async def _parse_call(
+    call: _CallResult,
+    *,
+    feature: str,
+    max_tokens: int,
+    attempt: int,
+    context: AIUsageContext,
+) -> dict | list:
+    try:
+        result = _extract_json(call.raw)
+    except Exception as error:
+        await _finalize_call(
+            call,
+            feature=feature,
+            max_tokens=max_tokens,
+            attempt=attempt,
+            status="failure",
+            context=context,
+            failure_type=type(error).__name__,
+        )
+        raise
+    await _finalize_call(
+        call,
+        feature=feature,
+        max_tokens=max_tokens,
+        attempt=attempt,
+        status="success",
+        context=context,
     )
     return result
 
 
-def _validate_call(
+async def _validate_call(
     call: _CallResult,
     response_model: type[ResponseModelT],
     *,
     feature: str,
     max_tokens: int,
     attempt: int,
+    context: AIUsageContext,
 ) -> ResponseModelT:
     try:
         result = _validate(call.raw, response_model)
     except Exception as error:
-        _log_call(
+        await _finalize_call(
+            call,
             feature=feature,
             max_tokens=max_tokens,
             attempt=attempt,
             status="failure",
-            latency_ms=call.latency_ms,
-            usage=call.usage,
+            context=context,
             failure_type=type(error).__name__,
         )
         raise
-    _log_call(
+    await _finalize_call(
+        call,
         feature=feature,
         max_tokens=max_tokens,
         attempt=attempt,
         status="success",
-        latency_ms=call.latency_ms,
-        usage=call.usage,
+        context=context,
     )
     return result
 
@@ -243,6 +367,7 @@ async def ask_json(
     *,
     response_model: None = None,
     feature: str = "unspecified",
+    usage_context: AIUsageContext | None = None,
 ) -> dict | list:
     ...
 
@@ -255,6 +380,7 @@ async def ask_json(
     *,
     response_model: type[ResponseModelT],
     feature: str = "unspecified",
+    usage_context: AIUsageContext | None = None,
 ) -> ResponseModelT:
     ...
 
@@ -266,7 +392,10 @@ async def ask_json(
     *,
     response_model: type[ResponseModelT] | None = None,
     feature: str = "unspecified",
+    usage_context: AIUsageContext | None = None,
 ) -> dict | list | ResponseModelT:
+    context = usage_context or AIUsageContext()
+    request_id = context.request_id or uuid.uuid4()
     if response_model is not None:
         return await _ask_typed(
             system,
@@ -274,11 +403,13 @@ async def ask_json(
             max_tokens=max_tokens,
             response_model=response_model,
             feature=feature,
+            context=context,
+            request_id=request_id,
         )
 
     # Backwards-compatible path for callers that still expect arbitrary JSON.
     last_err = None
-    for attempt in range(2):
+    for attempt in range(AI_MAX_TRANSPORT_RETRIES + 1):
         try:
             call = await _request(
                 system,
@@ -286,13 +417,18 @@ async def ask_json(
                 max_tokens,
                 feature=feature,
                 attempt=attempt + 1,
+                context=context,
+                request_id=request_id,
             )
-            return _parse_call(
+            return await _parse_call(
                 call,
                 feature=feature,
                 max_tokens=max_tokens,
                 attempt=attempt + 1,
+                context=context,
             )
+        except LLMGuardError:
+            raise
         except Exception as e:
             last_err = e
             log.warning(
@@ -309,6 +445,8 @@ async def _ask_typed(
     max_tokens: int,
     response_model: type[ResponseModelT],
     feature: str,
+    context: AIUsageContext,
+    request_id: uuid.UUID,
 ) -> ResponseModelT:
     try:
         call = await _request(
@@ -317,7 +455,11 @@ async def _ask_typed(
             max_tokens,
             feature=feature,
             attempt=1,
+            context=context,
+            request_id=request_id,
         )
+    except LLMGuardError:
+        raise
     except Exception as first_error:
         log.warning(
             "llm request failed; retrying once: error=%s",
@@ -330,14 +472,19 @@ async def _ask_typed(
                 max_tokens,
                 feature=feature,
                 attempt=2,
+                context=context,
+                request_id=request_id,
             )
-            return _validate_call(
+            return await _validate_call(
                 retry_call,
                 response_model,
                 feature=feature,
                 max_tokens=max_tokens,
                 attempt=2,
+                context=context,
             )
+        except LLMGuardError:
+            raise
         except Exception as second_error:
             log.error(
                 "llm request failed after retry: model=%s error=%s",
@@ -350,12 +497,13 @@ async def _ask_typed(
             ) from second_error
 
     try:
-        return _validate_call(
+        return await _validate_call(
             call,
             response_model,
             feature=feature,
             max_tokens=max_tokens,
             attempt=1,
+            context=context,
         )
     except (json.JSONDecodeError, ValidationError) as error:
         validation_error = error
@@ -366,6 +514,11 @@ async def _ask_typed(
             _validation_error_text(validation_error),
         )
 
+    if AI_MAX_REPAIR_PER_REQUEST < 1:
+        raise LLMError(
+            f"LLM response validation failed for {response_model.__name__}"
+        )
+
     try:
         repair_call = await _request(
             _REPAIR_SYSTEM,
@@ -373,14 +526,19 @@ async def _ask_typed(
             max_tokens,
             feature=feature,
             attempt=2,
+            context=context,
+            request_id=request_id,
         )
-        return _validate_call(
+        return await _validate_call(
             repair_call,
             response_model,
             feature=feature,
             max_tokens=max_tokens,
             attempt=2,
+            context=context,
         )
+    except LLMGuardError:
+        raise
     except Exception as repair_error:
         log.error(
             "llm response repair failed: model=%s error=%s",

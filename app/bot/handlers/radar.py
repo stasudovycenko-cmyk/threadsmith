@@ -17,10 +17,11 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 from sqlalchemy import text
 
 from app.core import credits, radar
+from app.core.ai_cost import AIUsageContext
 from app.core.config import CREDIT_COSTS
 from app.core.crypto import decrypt_token
 from app.core.db import Session
-from app.core.llm import LLMError
+from app.core.llm import LLMError, LLMGuardError
 
 log = logging.getLogger("radar_bot")
 router = Router()
@@ -164,7 +165,7 @@ async def cb_top(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("rd:rz:"))
 async def cb_razbor(cb: CallbackQuery):
     pid = cb.data.rsplit(":", 1)[1]
-    uid, _, _ = await _uid_acc(cb.from_user.id)
+    uid, acc_id, _ = await _uid_acc(cb.from_user.id)
     cost = CREDIT_COSTS["razbor"]
 
     async with Session() as s:
@@ -178,8 +179,24 @@ async def cb_razbor(cb: CallbackQuery):
     await cb.answer("Разбираю...")
     try:
         async with Session() as s:
-            r = await radar.razbor(s, pid)
+            r = await radar.razbor(
+                s,
+                pid,
+                usage_context=AIUsageContext(
+                    user_id=uid,
+                    threads_account_id=acc_id,
+                ),
+            )
             await s.commit()
+    except LLMGuardError:
+        async with Session() as s:
+            await credits.topup(s, uid, cost, "refund_razbor_ai_guard")
+            await s.commit()
+        await cb.message.answer(
+            "AI-разбор временно остановлен защитным лимитом. "
+            "Кредиты вернул."
+        )
+        return
     except (LLMError, ValueError):
         async with Session() as s:
             await credits.topup(s, uid, cost, "refund_razbor")

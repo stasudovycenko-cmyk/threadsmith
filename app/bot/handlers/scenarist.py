@@ -21,9 +21,10 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 from sqlalchemy import text
 
 from app.core import credits, scenarist, social_brain
+from app.core.ai_cost import AIUsageContext
 from app.core.config import CREDIT_COSTS
 from app.core.db import Session
-from app.core.llm import LLMError
+from app.core.llm import LLMError, LLMGuardError
 
 log = logging.getLogger("scenarist_bot")
 router = Router()
@@ -181,6 +182,15 @@ async def voice_done(msg: Message, state: FSMContext):
         async with Session() as s:
             profile = await scenarist.build_voice_profile(s, uid, posts)
             await s.commit()
+    except LLMGuardError:
+        async with Session() as s:
+            await credits.topup(s, uid, cost, "refund_voice_ai_guard")
+            await s.commit()
+        await msg.answer(
+            "AI сейчас временно недоступен из-за защитного лимита. "
+            "Кредиты вернул."
+        )
+        return
     except LLMError:
         async with Session() as s:
             await credits.topup(s, uid, cost, "refund_voice_fail")
@@ -314,12 +324,16 @@ async def _run_generation(msg: Message, gen_type: str, inp: dict,
 
     await msg.answer("Пишу...")
     try:
+        account_id = (
+            threads_account_id
+            if threads_account_id is not None
+            else await _single_account_id(uid)
+        )
+        usage_context = AIUsageContext(
+            user_id=uid,
+            threads_account_id=account_id,
+        )
         if gen_type == "generate_post":
-            account_id = (
-                threads_account_id
-                if threads_account_id is not None
-                else await _single_account_id(uid)
-            )
             brain = (
                 await _load_brain(uid, account_id)
                 if account_id is not None
@@ -330,11 +344,29 @@ async def _run_generation(msg: Message, gen_type: str, inp: dict,
                 inp["topic"],
                 inp.get("reference"),
                 brain=brain,
+                usage_context=usage_context,
             )
         elif gen_type == "rewrite":
-            out = await scenarist.rewrite_post(profile, inp["source"])
+            out = await scenarist.rewrite_post(
+                profile,
+                inp["source"],
+                usage_context=usage_context,
+            )
         else:
-            out = await scenarist.generate_thread(profile, inp["topic"])
+            out = await scenarist.generate_thread(
+                profile,
+                inp["topic"],
+                usage_context=usage_context,
+            )
+    except LLMGuardError:
+        async with Session() as s:
+            await credits.topup(s, uid, cost, f"refund_{gen_type}_ai_guard")
+            await s.commit()
+        await msg.answer(
+            "AI сейчас временно недоступен из-за защитного лимита. "
+            "Кредиты вернул."
+        )
+        return
     except (LLMError, KeyError):
         log.exception("generation failed type=%s uid=%s", gen_type, uid)
         async with Session() as s:
