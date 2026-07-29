@@ -52,7 +52,7 @@ async def main():
     sched = AsyncIOScheduler()
     sched.add_job(token_refresher, "interval", hours=12)
     sched.add_job(publisher, "interval", minutes=1, max_instances=1)
-    sched.add_job(comment_poller, "interval", minutes=5, max_instances=1)
+    # comment_poller disabled until threads_manage_replies is approved by Meta
     sched.add_job(library_crawler, "interval", hours=1, max_instances=1)
     sched.add_job(neuro_hunter, "interval", minutes=20, max_instances=1)
     sched.add_job(autocontent_planner, "interval", hours=1, max_instances=1)

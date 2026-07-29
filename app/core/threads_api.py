@@ -99,7 +99,7 @@ async def create_container(token: str, threads_user_id: str, text: str,
     async with httpx.AsyncClient(timeout=30) as c:
         last = None
         for attempt in range(6):
-            r = await c.post(f"{BASE}/v1.0/me/threads", params=params)
+            r = await c.post(f"{BASE}/v1.0/{threads_user_id}/threads", params=params)
             if r.status_code == 200:
                 return r.json()["id"]
             last = r
@@ -115,7 +115,7 @@ async def publish_container(token: str, threads_user_id: str,
     async with httpx.AsyncClient(timeout=30) as c:
         last = None
         for attempt in range(6):
-            r = await c.post(f"{BASE}/v1.0/me/threads_publish",
+            r = await c.post(f"{BASE}/v1.0/{threads_user_id}/threads_publish",
                              params={"access_token": token,
                                      "creation_id": container_id})
             if r.status_code == 200:
