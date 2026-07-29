@@ -84,7 +84,7 @@ class ContentMetadata(ContentModel):
 
 
 class ContentGenerationResponse(ContentModel):
-    brief: ContentBrief
+    brief: ContentBrief = Field(default_factory=ContentBrief)
     hooks: list[ContentHook] = Field(min_length=3, max_length=3)
     body: str
     metadata: ContentMetadata
