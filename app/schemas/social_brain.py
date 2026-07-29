@@ -103,6 +103,10 @@ class BrainTaskContext(BrainModel):
     budget_tokens: int = Field(ge=1)
     estimated_tokens: int = Field(ge=0)
     trimmed_fields: list[str] = Field(default_factory=list)
+    brain_id: int | None = None
+    brain_version: int | None = Field(default=None, ge=1)
+    pattern_ids: list[int] = Field(default_factory=list)
+    pattern_keys: list[str] = Field(default_factory=list)
 
     @property
     def within_budget(self) -> bool:

@@ -291,10 +291,32 @@ class ContextBuilder:
             task,
             budget_tokens,
         )
+        pattern_identity = {
+            (pattern.kind, pattern.key, pattern.metric): pattern
+            for pattern in patterns
+        }
+        selected_patterns = []
+        for item in compact.get("patterns", []):
+            if not isinstance(item, dict):
+                continue
+            pattern = pattern_identity.get((
+                item.get("kind"),
+                item.get("key"),
+                item.get("metric"),
+            ))
+            if pattern is not None:
+                selected_patterns.append(pattern)
         return BrainTaskContext(
             task=task,
             context=compact,
             budget_tokens=budget_tokens,
             estimated_tokens=estimate_tokens(compact),
             trimmed_fields=trimmed,
+            brain_id=brain.id,
+            brain_version=brain.version,
+            pattern_ids=[pattern.id for pattern in selected_patterns],
+            pattern_keys=[
+                f"{pattern.kind}:{pattern.key}:{pattern.metric}"
+                for pattern in selected_patterns
+            ],
         )

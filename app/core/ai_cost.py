@@ -113,7 +113,10 @@ class ResolvedLimits:
 AI_FEATURE_DAILY_USD_LIMITS: dict[str, Decimal] = {
     "voice_profile": Decimal("10.00"),
     "generate_post": Decimal("20.00"),
+    "content_generate": Decimal("20.00"),
+    "content_repair": Decimal("10.00"),
     "autocontent": Decimal("10.00"),
+    "autocontent_repair": Decimal("10.00"),
     "rewrite": Decimal("15.00"),
     "generate_thread": Decimal("15.00"),
     "radar_analysis": Decimal("10.00"),
@@ -122,16 +125,19 @@ AI_FEATURE_DAILY_USD_LIMITS: dict[str, Decimal] = {
 }
 AI_FEATURE_HOURLY_CALL_LIMITS: dict[str, int] = {
     "autocontent": 100,
+    "autocontent_repair": 100,
     "neuro_comment": 100,
     "radar_analysis": 100,
 }
 AI_DEFAULT_FEATURE_HOURLY_CALL_LIMIT = 200
 AI_RUN_USD_LIMITS: dict[str, Decimal] = {
     "autocontent": Decimal("0.25"),
+    "autocontent_repair": Decimal("0.25"),
     "neuro_comment": Decimal("0.15"),
 }
 AI_RUN_CALL_LIMITS: dict[str, int] = {
     "autocontent": 10,
+    "autocontent_repair": 10,
     "neuro_comment": 5,
 }
 AI_ACCOUNT_FEATURE_DAILY_CALL_LIMITS: dict[str, int] = {
@@ -241,7 +247,10 @@ def estimate_reservation_cost(
 def _feature_enabled(feature: str) -> tuple[bool, str]:
     if not settings.AI_ENABLED:
         return False, "global"
-    if feature == "autocontent" and not settings.AI_AUTOCONTENT_ENABLED:
+    if (
+        feature.startswith("autocontent")
+        and not settings.AI_AUTOCONTENT_ENABLED
+    ):
         return False, "autocontent"
     if feature == "neuro_comment" and not settings.AI_NEURO_ENABLED:
         return False, "neuro"

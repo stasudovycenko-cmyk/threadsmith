@@ -329,7 +329,10 @@ def test_feature_specific_max_tokens_are_conservative():
     assert llm.LLM_MAX_TOKENS == {
         "voice_profile": 1600,
         "generate_post": 1000,
+        "content_generate": 1400,
+        "content_repair": 1400,
         "autocontent": 1000,
+        "autocontent_repair": 1400,
         "rewrite": 1000,
         "generate_thread": 2600,
         "radar_analysis": 1200,

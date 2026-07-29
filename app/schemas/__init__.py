@@ -1,5 +1,14 @@
 """Typed schemas used at application boundaries."""
 
+from app.schemas.content_engine import (
+    ContentAngle,
+    ContentBrief,
+    ContentFormat,
+    ContentGenerationResponse,
+    ContentHook,
+    ContentMetadata,
+    ContentQuality,
+)
 from app.schemas.llm import (
     Hook,
     HookType,
@@ -27,6 +36,13 @@ from app.schemas.social_brain import (
 )
 
 __all__ = [
+    "ContentAngle",
+    "ContentBrief",
+    "ContentFormat",
+    "ContentGenerationResponse",
+    "ContentHook",
+    "ContentMetadata",
+    "ContentQuality",
     "Hook",
     "HookType",
     "NeuroCommentResponse",

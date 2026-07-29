@@ -22,6 +22,7 @@ from sqlalchemy import text
 
 from app.core import credits, scenarist, social_brain
 from app.core.ai_cost import AIUsageContext
+from app.core.content_engine import ContentMemoryRepo
 from app.core.config import CREDIT_COSTS
 from app.core.db import Session
 from app.core.llm import LLMError, LLMGuardError
@@ -93,18 +94,14 @@ async def _single_account_id(uid: int) -> int | None:
 async def _load_brain(uid: int, threads_account_id: int):
     try:
         async with Session() as s:
-            repo = social_brain.BrainRepo(s)
-            writer = social_brain.BrainWriter(s, repo)
-            brain = await writer.apply_backfill(
-                uid,
-                threads_account_id,
-            )
-            context = await social_brain.ContextBuilder(
-                repo
-            ).build_context(
-                brain.id,
-                "generation",
-                scenarist.GENERATION_BRAIN_BUDGET_TOKENS,
+            context = await social_brain.build_account_context(
+                s,
+                user_id=uid,
+                threads_account_id=threads_account_id,
+                task="generation",
+                budget_tokens=(
+                    scenarist.GENERATION_BRAIN_BUDGET_TOKENS
+                ),
             )
             await s.commit()
             return context
@@ -118,6 +115,29 @@ async def _load_brain(uid: int, threads_account_id: int):
             type(exc).__name__,
         )
         return None
+
+
+async def _load_content_memory(
+    uid: int,
+    threads_account_id: int | None,
+):
+    if threads_account_id is None:
+        return []
+    try:
+        async with Session() as s:
+            return await ContentMemoryRepo(s).load(
+                uid,
+                threads_account_id,
+            )
+    except Exception as exc:
+        log.warning(
+            "Content memory unavailable uid=%s account=%s "
+            "error_type=%s; using empty memory",
+            uid,
+            threads_account_id,
+            type(exc).__name__,
+        )
+        return []
 
 
 def _render(gen: dict) -> str:
@@ -339,12 +359,14 @@ async def _run_generation(msg: Message, gen_type: str, inp: dict,
                 if account_id is not None
                 else None
             )
+            memory = await _load_content_memory(uid, account_id)
             out = await scenarist.generate_post(
                 profile,
                 inp["topic"],
                 inp.get("reference"),
                 brain=brain,
                 usage_context=usage_context,
+                memory=memory,
             )
         elif gen_type == "rewrite":
             out = await scenarist.rewrite_post(

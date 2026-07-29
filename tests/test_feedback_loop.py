@@ -12,6 +12,7 @@ from app.core.feedback_loop import (
     baseline_for,
     confidence_for,
     normalize_post,
+    post_features,
     rebuild_patterns,
 )
 from app.core.goal_metrics import normalize_goal
@@ -134,6 +135,38 @@ def make_post(
         engagement_rate=engagement_rate,
         available_metrics=("views", "engagement_rate"),
     )
+
+
+def test_post_features_include_content_engine_metadata():
+    post = make_post(1).model_copy(update={
+        "content_metadata": {
+            "angle": "Contrarian",
+            "format": "compact_post",
+            "hook_type": "unpopular",
+            "cta_type": "comment",
+            "source": "autocontent",
+            "has_cta": True,
+        },
+    })
+    features = {
+        (feature.kind, feature.key)
+        for feature in post_features(post)
+    }
+    assert ("content_angle", "contrarian") in features
+    assert ("content_format", "compact_post") in features
+    assert ("hook_type", "unpopular") in features
+    assert ("cta_type", "comment") in features
+    assert ("content_source", "autocontent") in features
+    assert ("has_cta", "true") in features
+
+
+def test_old_post_without_content_metadata_skips_unknown_features():
+    kinds = {feature.kind for feature in post_features(make_post(1))}
+    assert kinds == {
+        "length_bucket",
+        "publication_window_utc",
+        "has_link",
+    }
 
 
 class MemoryRepo:
@@ -601,7 +634,7 @@ def test_feedback_rebuild_updates_performance_and_version_once():
     assert result.brain_version == 2
     assert repo.brain.version == 2
     assert repo.brain.performance["rolling_30d"]["published_posts"] == 8
-    assert feedback["projection_version"] == 2
+    assert feedback["projection_version"] == 3
     assert "goal" not in feedback
     assert feedback["metrics"]["views"]["latest"] == {
         "status": "ok",

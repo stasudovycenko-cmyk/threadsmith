@@ -13,6 +13,7 @@
 Так Сценарист + Автопилот работают в автономном режиме: контент сам
 пишется и сам публикуется (публикацией занимается publisher из m3_jobs).
 """
+import json
 import logging
 import random
 import uuid
@@ -20,7 +21,7 @@ from datetime import date, datetime, time, timedelta, timezone
 
 from sqlalchemy import text
 
-from app.core import credits, scenarist
+from app.core import credits, scenarist, social_brain
 from app.core.ai_cost import (
     AUTOCONTENT_MAX_GENERATIONS_PER_PLANNER_RUN,
     AUTOCONTENT_MAX_GENERATIONS_PER_USER_RUN,
@@ -29,6 +30,7 @@ from app.core.ai_cost import (
     AIUsageContext,
 )
 from app.core.config import CREDIT_COSTS
+from app.core.content_engine import ContentMemoryRepo
 from app.core.db import Session
 from app.core.llm import LLMGuardError
 
@@ -193,12 +195,6 @@ async def _plan_for_user(
             "WHERE user_id = :uid AND threads_account_id = :acc"
         ), {"uid": uid, "acc": acc_id})).first()
         total_posts = trow2[0] if trow2 else 0
-        rrows = (await s.execute(text(
-            "SELECT text FROM scheduled_posts "
-            "WHERE user_id = :uid AND threads_account_id = :acc "
-            "ORDER BY id DESC LIMIT 8"
-        ), {"uid": uid, "acc": acc_id})).all()
-        recent = [r[0] for r in rrows if r[0]]
         pending_row = (await s.execute(text("""
             SELECT count(*) FROM scheduled_posts
             WHERE user_id = :uid
@@ -206,6 +202,35 @@ async def _plan_for_user(
               AND status = 'pending'
         """), {"uid": uid, "acc": acc_id})).first()
         pending_count = int(pending_row[0] if pending_row else 0)
+        try:
+            brain = await social_brain.build_account_context(
+                s,
+                user_id=uid,
+                threads_account_id=acc_id,
+                task="autocontent",
+                budget_tokens=scenarist.GENERATION_BRAIN_BUDGET_TOKENS,
+            )
+        except Exception as exc:
+            brain = None
+            log.warning(
+                "autocontent Brain unavailable uid=%s account=%s "
+                "error_type=%s",
+                uid,
+                acc_id,
+                type(exc).__name__,
+            )
+        try:
+            memory = await ContentMemoryRepo(s).load(uid, acc_id)
+        except Exception as exc:
+            memory = []
+            log.warning(
+                "autocontent memory unavailable uid=%s account=%s "
+                "error_type=%s",
+                uid,
+                acc_id,
+                type(exc).__name__,
+            )
+        await s.commit()
 
     daily_limit = min(
         AUTOCONTENT_MAX_POSTS_PER_USER_DAY,
@@ -312,10 +337,12 @@ async def _plan_for_user(
             out = await scenarist.generate_post(
                 profile,
                 topic,
-                recent=recent,
                 goal=goal_key,
                 feature="autocontent",
+                brain=brain,
                 usage_context=usage_context,
+                memory=memory,
+                source="autocontent",
             )
         except LLMGuardError as error:
             async with Session() as s:
@@ -334,20 +361,39 @@ async def _plan_for_user(
             log.exception("autocontent gen failed uid=%s", uid)
             continue
 
-        # собираем пост: первый хук + тело
+        # собираем пост: выбранный хук + тело
         hooks = out.get("hooks", [])
-        hook = hooks[0]["text"] if hooks else ""
+        selected_hook = out.get("selected_hook") or {}
+        hook = (
+            selected_hook.get("text")
+            or (hooks[0]["text"] if hooks else "")
+        )
         body = out.get("body", "")
         post_text = scenarist.trim_post(hook + chr(10) + chr(10) + body)
+        metadata = out.get("metadata") or {}
 
         run_at = available_times[i]
 
         async with Session() as s:
             await s.execute(text("""
                 INSERT INTO scheduled_posts
-                    (user_id, threads_account_id, text, run_at, status)
-                VALUES (:uid, :acc, :txt, :run, 'pending')
-            """), {"uid": uid, "acc": acc_id, "txt": post_text, "run": run_at})
+                    (user_id, threads_account_id, text, run_at, status,
+                     content_metadata)
+                VALUES (
+                    :uid, :acc, :txt, :run, 'pending',
+                    CAST(:metadata AS jsonb)
+                )
+            """), {
+                "uid": uid,
+                "acc": acc_id,
+                "txt": post_text,
+                "run": run_at,
+                "metadata": json.dumps(
+                    metadata,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            })
             await s.commit()
         log.info("autocontent: +пост uid=%s на %s", uid, run_at.isoformat())
     return attempts
