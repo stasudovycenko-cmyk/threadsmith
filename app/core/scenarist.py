@@ -12,6 +12,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.llm import ask_json
+from app.schemas.llm import (
+    PostGenerationResponse,
+    ThreadGenerationResponse,
+    VoiceProfileResponse,
+)
 
 # Банк хуков - вшит в промпт. 11 типов из ТЗ.
 HOOKS = {
@@ -112,10 +117,12 @@ async def get_voice(session: AsyncSession, user_id: int) -> dict | None:
 
 async def build_voice_profile(session: AsyncSession, user_id: int,
                               posts: list[str]) -> dict:
-    profile = await ask_json(
+    response = await ask_json(
         VOICE_SYSTEM,
         "Посты автора:\n\n" + "\n\n---\n\n".join(posts),
+        response_model=VoiceProfileResponse,
     )
+    profile = response.model_dump(mode="json")
     await session.execute(text("""
         INSERT INTO voice_profiles (user_id, profile_json, sample_posts, updated_at)
         VALUES (:uid, :p, :sp, now())
@@ -133,25 +140,31 @@ async def generate_post(profile: dict, topic: str,
     user = f"Тема поста: {topic}"
     if reference:
         user += f"\n\nПост-референс (укради механику, не текст):\n{reference}"
-    return await ask_json(
+    response = await ask_json(
         GEN_SYSTEM_TMPL.format(profile=_profile_str(profile), hooks=_HOOKS_TEXT),
         user,
+        response_model=PostGenerationResponse,
     )
+    return response.model_dump(mode="json")
 
 
 async def rewrite_post(profile: dict, source: str) -> dict:
-    return await ask_json(
+    response = await ask_json(
         REWRITE_SYSTEM_TMPL.format(profile=_profile_str(profile), hooks=_HOOKS_TEXT),
         f"Исходный пост:\n{source}",
+        response_model=PostGenerationResponse,
     )
+    return response.model_dump(mode="json")
 
 
 async def generate_thread(profile: dict, topic: str) -> dict:
-    return await ask_json(
+    response = await ask_json(
         THREAD_SYSTEM_TMPL.format(profile=_profile_str(profile)),
         f"Тема ветки: {topic}",
         max_tokens=3000,
+        response_model=ThreadGenerationResponse,
     )
+    return response.model_dump(mode="json")
 
 
 async def log_generation(session: AsyncSession, user_id: int, gen_type: str,

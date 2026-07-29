@@ -20,6 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.llm import ask_json
+from app.schemas.llm import NeuroCommentResponse
 
 log = logging.getLogger("neuro")
 
@@ -49,11 +50,13 @@ _LINK_RE = re.compile(r"(https?://|t\.me/|@[\w.]+|www\.)", re.I)
 
 async def generate_comment(profile: dict, niche: str,
                            post_text: str, author: str) -> dict:
-    result = await ask_json(
+    response = await ask_json(
         NEURO_SYSTEM_TMPL.format(
             profile=json.dumps(profile, ensure_ascii=False), niche=niche),
         f"Пост от @{author}:\n\n{post_text}",
+        response_model=NeuroCommentResponse,
     )
+    result = response.model_dump(mode="json")
     # постфильтр: LLM сказали без ссылок, но доверяй и проверяй
     comment = result.get("comment") or ""
     if result.get("relevant") and _LINK_RE.search(comment):

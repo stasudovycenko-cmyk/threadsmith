@@ -25,6 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.crypto import decrypt_token
 from app.core.llm import ask_json
 from app.core.threads_api import keyword_search
+from app.schemas.llm import RadarAnalysisResponse
 
 log = logging.getLogger("radar")
 
@@ -139,7 +140,12 @@ async def razbor(session: AsyncSession, post_id: str) -> dict:
     ), {"pid": post_id})).first()
     if not row:
         raise ValueError("post not in library")
-    result = await ask_json(RAZBOR_SYSTEM, f"Пост:\n{row[0]}")
+    response = await ask_json(
+        RAZBOR_SYSTEM,
+        f"Пост:\n{row[0]}",
+        response_model=RadarAnalysisResponse,
+    )
+    result = response.model_dump(mode="json")
     await session.execute(text("""
         UPDATE posts_library SET hook_type = :ht WHERE threads_post_id = :pid
     """), {"ht": result.get("hook_type"), "pid": post_id})
