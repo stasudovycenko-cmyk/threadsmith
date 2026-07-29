@@ -10,11 +10,10 @@ from app.schemas.llm import (
     VoiceProfileResponse,
 )
 from app.schemas.social_brain import (
-    AutocontentBrainContext,
-    GenerationBrainContext,
-    NeuroBrainContext,
-    RadarBrainContext,
-    SocialBrainContext,
+    BrainEvent,
+    BrainPattern,
+    BrainRecord,
+    BrainTaskContext,
 )
 
 __all__ = [
@@ -25,9 +24,8 @@ __all__ = [
     "RadarAnalysisResponse",
     "ThreadGenerationResponse",
     "VoiceProfileResponse",
-    "AutocontentBrainContext",
-    "GenerationBrainContext",
-    "NeuroBrainContext",
-    "RadarBrainContext",
-    "SocialBrainContext",
+    "BrainEvent",
+    "BrainPattern",
+    "BrainRecord",
+    "BrainTaskContext",
 ]

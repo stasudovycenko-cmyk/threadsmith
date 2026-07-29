@@ -90,16 +90,28 @@ async def _single_account_id(uid: int) -> int | None:
 async def _load_brain(uid: int, threads_account_id: int):
     try:
         async with Session() as s:
-            return await social_brain.build_brain_context(
-                s,
+            repo = social_brain.BrainRepo(s)
+            writer = social_brain.BrainWriter(s, repo)
+            brain = await writer.apply_backfill(
                 uid,
                 threads_account_id,
             )
+            context = await social_brain.ContextBuilder(
+                repo
+            ).build_context(
+                brain.id,
+                "generation",
+                scenarist.GENERATION_BRAIN_BUDGET_TOKENS,
+            )
+            await s.commit()
+            return context
     except Exception as exc:
         log.warning(
-            "Social Brain unavailable uid=%s error_type=%s; "
+            "Social Brain unavailable uid=%s account=%s "
+            "error_type=%s; "
             "using legacy context",
             uid,
+            threads_account_id,
             type(exc).__name__,
         )
         return None
