@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.llm import ask_json
+from app.core.llm import LLM_MAX_TOKENS, ask_json
 from app.schemas.llm import NeuroCommentResponse
 
 log = logging.getLogger("neuro")
@@ -52,9 +52,15 @@ async def generate_comment(profile: dict, niche: str,
                            post_text: str, author: str) -> dict:
     response = await ask_json(
         NEURO_SYSTEM_TMPL.format(
-            profile=json.dumps(profile, ensure_ascii=False), niche=niche),
+            profile=json.dumps(
+                profile, ensure_ascii=False, separators=(",", ":")
+            ),
+            niche=niche,
+        ),
         f"Пост от @{author}:\n\n{post_text}",
+        max_tokens=LLM_MAX_TOKENS["neuro_comment"],
         response_model=NeuroCommentResponse,
+        feature="neuro_comment",
     )
     result = response.model_dump(mode="json")
     # постфильтр: LLM сказали без ссылок, но доверяй и проверяй
@@ -93,7 +99,7 @@ async def pick_candidates(session: AsyncSession, user_id: int, niche: str,
         FROM posts_library pl
         WHERE pl.niche = :niche
           AND pl.fetched_at > now() - interval '24 hours'
-          AND length(pl.text) > 50
+          AND length(trim(pl.text)) > 50
           AND pl.author_id NOT IN (
               SELECT username FROM threads_accounts WHERE user_id = :uid
           )

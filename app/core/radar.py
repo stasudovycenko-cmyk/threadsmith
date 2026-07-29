@@ -23,7 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import decrypt_token
-from app.core.llm import ask_json
+from app.core.llm import LLM_MAX_TOKENS, ask_json
 from app.core.threads_api import keyword_search
 from app.schemas.llm import RadarAnalysisResponse
 
@@ -114,7 +114,7 @@ async def top_posts(session: AsyncSession, niche: str,
                metrics_json->>'permalink' AS permalink
         FROM posts_library
         WHERE niche = :niche AND fetched_at > now() - interval '14 days'
-          AND length(text) > 30
+          AND length(trim(text)) > 30
         ORDER BY virality_score DESC, fetched_at DESC
         LIMIT :lim
     """), {"niche": niche, "lim": limit})).all()
@@ -140,10 +140,15 @@ async def razbor(session: AsyncSession, post_id: str) -> dict:
     ), {"pid": post_id})).first()
     if not row:
         raise ValueError("post not in library")
+    post_text = (row[0] or "").strip()
+    if len(post_text) <= 30:
+        raise ValueError("post text is too short")
     response = await ask_json(
         RAZBOR_SYSTEM,
-        f"Пост:\n{row[0]}",
+        f"Пост:\n{post_text}",
+        max_tokens=LLM_MAX_TOKENS["radar_analysis"],
         response_model=RadarAnalysisResponse,
+        feature="radar_analysis",
     )
     result = response.model_dump(mode="json")
     await session.execute(text("""

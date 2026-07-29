@@ -11,7 +11,7 @@ import json
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.llm import ask_json
+from app.core.llm import LLM_MAX_TOKENS, ask_json
 from app.schemas.llm import (
     PostGenerationResponse,
     ThreadGenerationResponse,
@@ -105,7 +105,9 @@ THREAD_SYSTEM_TMPL = """Ты - ghostwriter для Threads. Пишешь ветк
 
 
 def _profile_str(profile: dict) -> str:
-    return json.dumps(profile, ensure_ascii=False, indent=1)
+    return json.dumps(
+        profile, ensure_ascii=False, separators=(",", ":")
+    )
 
 
 async def get_voice(session: AsyncSession, user_id: int) -> dict | None:
@@ -120,7 +122,9 @@ async def build_voice_profile(session: AsyncSession, user_id: int,
     response = await ask_json(
         VOICE_SYSTEM,
         "Посты автора:\n\n" + "\n\n---\n\n".join(posts),
+        max_tokens=LLM_MAX_TOKENS["voice_profile"],
         response_model=VoiceProfileResponse,
+        feature="voice_profile",
     )
     profile = response.model_dump(mode="json")
     await session.execute(text("""
@@ -135,7 +139,8 @@ async def build_voice_profile(session: AsyncSession, user_id: int,
 
 
 async def generate_post(profile: dict, topic: str,
-                        reference: str | None = None) -> dict:
+                        reference: str | None = None, *,
+                        feature: str = "generate_post") -> dict:
     """Тема или референс -> {hooks: [3 варианта], body}."""
     user = f"Тема поста: {topic}"
     if reference:
@@ -143,7 +148,11 @@ async def generate_post(profile: dict, topic: str,
     response = await ask_json(
         GEN_SYSTEM_TMPL.format(profile=_profile_str(profile), hooks=_HOOKS_TEXT),
         user,
+        max_tokens=LLM_MAX_TOKENS.get(
+            feature, LLM_MAX_TOKENS["generate_post"]
+        ),
         response_model=PostGenerationResponse,
+        feature=feature,
     )
     return response.model_dump(mode="json")
 
@@ -152,7 +161,9 @@ async def rewrite_post(profile: dict, source: str) -> dict:
     response = await ask_json(
         REWRITE_SYSTEM_TMPL.format(profile=_profile_str(profile), hooks=_HOOKS_TEXT),
         f"Исходный пост:\n{source}",
+        max_tokens=LLM_MAX_TOKENS["rewrite"],
         response_model=PostGenerationResponse,
+        feature="rewrite",
     )
     return response.model_dump(mode="json")
 
@@ -161,8 +172,9 @@ async def generate_thread(profile: dict, topic: str) -> dict:
     response = await ask_json(
         THREAD_SYSTEM_TMPL.format(profile=_profile_str(profile)),
         f"Тема ветки: {topic}",
-        max_tokens=3000,
+        max_tokens=LLM_MAX_TOKENS["generate_thread"],
         response_model=ThreadGenerationResponse,
+        feature="generate_thread",
     )
     return response.model_dump(mode="json")
 

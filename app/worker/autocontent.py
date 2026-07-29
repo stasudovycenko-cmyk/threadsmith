@@ -84,7 +84,9 @@ async def _plan_for_user(uid, per_day, niche, keywords, acc_id):
                 return
 
         try:
-            out = await scenarist.generate_post(profile, topic)
+            out = await scenarist.generate_post(
+                profile, topic, feature="autocontent"
+            )
         except Exception:
             async with Session() as s:
                 await credits.topup(s, uid, cost, "refund_autocontent")

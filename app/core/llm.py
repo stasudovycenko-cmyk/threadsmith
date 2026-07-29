@@ -8,6 +8,8 @@
 """
 import json
 import logging
+import time
+from dataclasses import dataclass
 from typing import TypeVar, overload
 
 from anthropic import AsyncAnthropic
@@ -19,18 +21,33 @@ log = logging.getLogger("llm")
 client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 MODEL = "claude-sonnet-4-6"  # sonnet: качество/цена ок для генерации постов
+DEFAULT_MAX_TOKENS = 2000
+LLM_MAX_TOKENS = {
+    "voice_profile": 1600,
+    "generate_post": 1000,
+    "autocontent": 1000,
+    "rewrite": 1000,
+    "generate_thread": 2600,
+    "radar_analysis": 1200,
+    "neuro_comment": 500,
+}
 _JSON_INSTRUCTION = (
     "Отвечай ТОЛЬКО валидным JSON. Без преамбулы, без markdown."
 )
-_REPAIR_SYSTEM = """Ты исправляешь только формат JSON-ответа.
-Верни только исправленный валидный JSON без преамбулы и markdown.
-Не добавляй новые идеи и не меняй смысл исходного ответа."""
+_REPAIR_SYSTEM = "Исправь JSON по ошибке валидации, не меняя смысл."
 
 ResponseModelT = TypeVar("ResponseModelT", bound=BaseModel)
 
 
 class LLMError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class _CallResult:
+    raw: str
+    usage: object | None
+    latency_ms: int
 
 
 def _extract_json(raw: str) -> dict | list:
@@ -45,14 +62,85 @@ def _extract_json(raw: str) -> dict | list:
     return json.loads(s[start:end])
 
 
-async def _request(system: str, user: str, max_tokens: int) -> str:
-    resp = await client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        system=system + f"\n\n{_JSON_INSTRUCTION}",
-        messages=[{"role": "user", "content": user}],
+def _usage_value(usage: object | None, field: str) -> int:
+    if usage is None:
+        return 0
+    value = getattr(usage, field, None)
+    if value is None and isinstance(usage, dict):
+        value = usage.get(field)
+    return int(value or 0)
+
+
+def _log_call(
+    *,
+    feature: str,
+    max_tokens: int,
+    attempt: int,
+    status: str,
+    latency_ms: int,
+    usage: object | None,
+    failure_type: str | None = None,
+) -> None:
+    event = {
+        "event": "llm_call",
+        "feature": feature,
+        "model": MODEL,
+        "input_tokens": _usage_value(usage, "input_tokens"),
+        "output_tokens": _usage_value(usage, "output_tokens"),
+        "cache_read_tokens": _usage_value(
+            usage, "cache_read_input_tokens"
+        ),
+        "cache_creation_tokens": _usage_value(
+            usage, "cache_creation_input_tokens"
+        ),
+        "latency_ms": latency_ms,
+        "attempt": attempt,
+        "status": status,
+        "max_tokens": max_tokens,
+    }
+    if failure_type:
+        event["failure_type"] = failure_type
+    log.info(
+        "llm_call %s",
+        json.dumps(event, ensure_ascii=True, separators=(",", ":")),
     )
-    return resp.content[0].text
+
+
+async def _request(
+    system: str,
+    user: str,
+    max_tokens: int,
+    *,
+    feature: str,
+    attempt: int,
+) -> _CallResult:
+    started_at = time.perf_counter()
+    resp = None
+    try:
+        resp = await client.messages.create(
+            model=MODEL,
+            max_tokens=max_tokens,
+            system=system + f"\n\n{_JSON_INSTRUCTION}",
+            messages=[{"role": "user", "content": user}],
+        )
+        raw = resp.content[0].text
+    except Exception as error:
+        latency_ms = round((time.perf_counter() - started_at) * 1000)
+        _log_call(
+            feature=feature,
+            max_tokens=max_tokens,
+            attempt=attempt,
+            status="failure",
+            latency_ms=latency_ms,
+            usage=getattr(resp, "usage", None),
+            failure_type=type(error).__name__,
+        )
+        raise
+    return _CallResult(
+        raw=raw,
+        usage=getattr(resp, "usage", None),
+        latency_ms=round((time.perf_counter() - started_at) * 1000),
+    )
 
 
 def _validation_error_text(error: Exception) -> str:
@@ -79,20 +167,82 @@ def _validate(raw: str, response_model: type[ResponseModelT]) -> ResponseModelT:
 
 def _repair_prompt(raw: str, error: Exception) -> str:
     return (
-        "Исправь JSON согласно ошибке валидации. Не меняй смысл ответа.\n\n"
-        f"Ошибка валидации:\n{_validation_error_text(error)}\n\n"
-        f"Исходный ответ модели:\n{raw}\n\n"
-        "Верни только исправленный JSON."
+        f"Ошибка:\n{_validation_error_text(error)}\n\n"
+        f"Исходный output:\n{raw}"
     )
+
+
+def _parse_call(
+    call: _CallResult,
+    *,
+    feature: str,
+    max_tokens: int,
+    attempt: int,
+) -> dict | list:
+    try:
+        result = _extract_json(call.raw)
+    except Exception as error:
+        _log_call(
+            feature=feature,
+            max_tokens=max_tokens,
+            attempt=attempt,
+            status="failure",
+            latency_ms=call.latency_ms,
+            usage=call.usage,
+            failure_type=type(error).__name__,
+        )
+        raise
+    _log_call(
+        feature=feature,
+        max_tokens=max_tokens,
+        attempt=attempt,
+        status="success",
+        latency_ms=call.latency_ms,
+        usage=call.usage,
+    )
+    return result
+
+
+def _validate_call(
+    call: _CallResult,
+    response_model: type[ResponseModelT],
+    *,
+    feature: str,
+    max_tokens: int,
+    attempt: int,
+) -> ResponseModelT:
+    try:
+        result = _validate(call.raw, response_model)
+    except Exception as error:
+        _log_call(
+            feature=feature,
+            max_tokens=max_tokens,
+            attempt=attempt,
+            status="failure",
+            latency_ms=call.latency_ms,
+            usage=call.usage,
+            failure_type=type(error).__name__,
+        )
+        raise
+    _log_call(
+        feature=feature,
+        max_tokens=max_tokens,
+        attempt=attempt,
+        status="success",
+        latency_ms=call.latency_ms,
+        usage=call.usage,
+    )
+    return result
 
 
 @overload
 async def ask_json(
     system: str,
     user: str,
-    max_tokens: int = 2000,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     *,
     response_model: None = None,
+    feature: str = "unspecified",
 ) -> dict | list:
     ...
 
@@ -101,9 +251,10 @@ async def ask_json(
 async def ask_json(
     system: str,
     user: str,
-    max_tokens: int = 2000,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     *,
     response_model: type[ResponseModelT],
+    feature: str = "unspecified",
 ) -> ResponseModelT:
     ...
 
@@ -111,20 +262,37 @@ async def ask_json(
 async def ask_json(
     system: str,
     user: str,
-    max_tokens: int = 2000,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     *,
     response_model: type[ResponseModelT] | None = None,
+    feature: str = "unspecified",
 ) -> dict | list | ResponseModelT:
     if response_model is not None:
         return await _ask_typed(
-            system, user, max_tokens=max_tokens, response_model=response_model
+            system,
+            user,
+            max_tokens=max_tokens,
+            response_model=response_model,
+            feature=feature,
         )
 
     # Backwards-compatible path for callers that still expect arbitrary JSON.
     last_err = None
     for attempt in range(2):
         try:
-            return _extract_json(await _request(system, user, max_tokens))
+            call = await _request(
+                system,
+                user,
+                max_tokens,
+                feature=feature,
+                attempt=attempt + 1,
+            )
+            return _parse_call(
+                call,
+                feature=feature,
+                max_tokens=max_tokens,
+                attempt=attempt + 1,
+            )
         except Exception as e:
             last_err = e
             log.warning(
@@ -140,17 +308,36 @@ async def _ask_typed(
     user: str,
     max_tokens: int,
     response_model: type[ResponseModelT],
+    feature: str,
 ) -> ResponseModelT:
     try:
-        raw = await _request(system, user, max_tokens)
+        call = await _request(
+            system,
+            user,
+            max_tokens,
+            feature=feature,
+            attempt=1,
+        )
     except Exception as first_error:
         log.warning(
             "llm request failed; retrying once: error=%s",
             _validation_error_text(first_error),
         )
         try:
-            raw = await _request(system, user, max_tokens)
-            return _validate(raw, response_model)
+            retry_call = await _request(
+                system,
+                user,
+                max_tokens,
+                feature=feature,
+                attempt=2,
+            )
+            return _validate_call(
+                retry_call,
+                response_model,
+                feature=feature,
+                max_tokens=max_tokens,
+                attempt=2,
+            )
         except Exception as second_error:
             log.error(
                 "llm request failed after retry: model=%s error=%s",
@@ -163,7 +350,13 @@ async def _ask_typed(
             ) from second_error
 
     try:
-        return _validate(raw, response_model)
+        return _validate_call(
+            call,
+            response_model,
+            feature=feature,
+            max_tokens=max_tokens,
+            attempt=1,
+        )
     except (json.JSONDecodeError, ValidationError) as error:
         validation_error = error
         log.warning(
@@ -174,12 +367,20 @@ async def _ask_typed(
         )
 
     try:
-        repaired_raw = await _request(
+        repair_call = await _request(
             _REPAIR_SYSTEM,
-            _repair_prompt(raw, validation_error),
+            _repair_prompt(call.raw, validation_error),
             max_tokens,
+            feature=feature,
+            attempt=2,
         )
-        return _validate(repaired_raw, response_model)
+        return _validate_call(
+            repair_call,
+            response_model,
+            feature=feature,
+            max_tokens=max_tokens,
+            attempt=2,
+        )
     except Exception as repair_error:
         log.error(
             "llm response repair failed: model=%s error=%s",
