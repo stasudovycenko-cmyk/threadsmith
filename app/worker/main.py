@@ -17,6 +17,7 @@ from app.worker.m3_jobs import comment_poller, publisher
 from app.worker.m4_jobs import neuro_hunter
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("worker")
 
 

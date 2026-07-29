@@ -12,22 +12,27 @@ Threads API: OAuth-флоу + обёртка над graph.threads.net.
 Скоупы запрашиваем все четыре сразу - Meta ревьюит каждый отдельно,
 но в dev mode на тестовых юзерах всё работает без ревью.
 """
+import asyncio
 import httpx
+from urllib.parse import urlencode
 
 from app.core.config import settings
 
 AUTH_URL = "https://threads.net/oauth/authorize"
 BASE = "https://graph.threads.net"
 
-SCOPES = "threads_basic,threads_content_publish,threads_manage_insights,threads_manage_replies"
+SCOPES = "threads_basic,threads_content_publish,threads_manage_insights,threads_manage_replies,threads_keyword_search"
 
 
 def auth_link(state: str) -> str:
-    return (
-        f"{AUTH_URL}?client_id={settings.THREADS_APP_ID}"
-        f"&redirect_uri={settings.THREADS_REDIRECT_URI}"
-        f"&scope={SCOPES}&response_type=code&state={state}"
-    )
+    params = {
+        "client_id": settings.THREADS_APP_ID,
+        "redirect_uri": settings.THREADS_REDIRECT_URI,
+        "scope": SCOPES,
+        "response_type": "code",
+        "state": state,
+    }
+    return f"{AUTH_URL}?{urlencode(params)}"
 
 
 async def exchange_code(code: str) -> dict:
@@ -92,20 +97,34 @@ async def create_container(token: str, threads_user_id: str, text: str,
     if reply_to_id:
         params["reply_to_id"] = reply_to_id
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(f"{BASE}/v1.0/{threads_user_id}/threads", params=params)
-        r.raise_for_status()
-        return r.json()["id"]
+        last = None
+        for attempt in range(6):
+            r = await c.post(f"{BASE}/v1.0/me/threads", params=params)
+            if r.status_code == 200:
+                return r.json()["id"]
+            last = r
+            if attempt < 5:
+                await asyncio.sleep(5)
+        last.raise_for_status()
+        return last.json()["id"]
 
 
 async def publish_container(token: str, threads_user_id: str,
                             container_id: str) -> str:
-    """Возвращает id опубликованного поста."""
+    """Publish container with retry (Threads flaky media-not-found)."""
     async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.post(f"{BASE}/v1.0/{threads_user_id}/threads_publish",
-                         params={"access_token": token,
-                                 "creation_id": container_id})
-        r.raise_for_status()
-        return r.json()["id"]
+        last = None
+        for attempt in range(6):
+            r = await c.post(f"{BASE}/v1.0/me/threads_publish",
+                             params={"access_token": token,
+                                     "creation_id": container_id})
+            if r.status_code == 200:
+                return r.json()["id"]
+            last = r
+            if attempt < 5:
+                await asyncio.sleep(5)
+        last.raise_for_status()
+        return last.json()["id"]
 
 
 async def get_replies(token: str, post_id: str) -> list[dict]:
@@ -129,8 +148,7 @@ async def keyword_search(token: str, query: str,
         r = await c.get(f"{BASE}/v1.0/keyword_search", params={
             "q": query,
             "search_type": search_type,
-            "fields": "id,text,media_type,permalink,timestamp,username,"
-                      "has_replies,is_quote_post,is_reply",
+            "fields": "id,text,username",
             "access_token": token,
         })
         r.raise_for_status()

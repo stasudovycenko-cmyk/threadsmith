@@ -14,7 +14,6 @@ from app.core.config import PLANS
 from app.core.db import Session
 from app.core.robokassa import payment_link
 from app.core.threads_api import auth_link
-from app.bot.handlers.nav import NAV_KB
 
 router = Router()
 
@@ -28,7 +27,6 @@ def main_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(text="🔗 Подключить Threads", callback_data="connect")],
         [InlineKeyboardButton(text="💳 Тарифы", callback_data="plans"),
          InlineKeyboardButton(text="⚡ Баланс", callback_data="balance")],
-        [InlineKeyboardButton(text="📄 Документы", callback_data="docs:menu")],
     ])
 
 
@@ -71,7 +69,6 @@ async def cmd_start(msg: Message, command: CommandObject):
             """), {"uid": uid})
         await s.commit()
 
-    await msg.answer("Навигация — кнопки снизу 👇", reply_markup=NAV_KB)
     await msg.answer(
         "Бот для Threads: тренды ниши, посты твоим голосом, автопостинг "
         "и автоответы по кодовым словам.\n\n"

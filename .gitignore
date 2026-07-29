@@ -1,0 +1,8 @@
+.env
+.env.*
+*.bak
+*.backup
+*.backup-*
+__pycache__/
+*.pyc
+handlers.bak/

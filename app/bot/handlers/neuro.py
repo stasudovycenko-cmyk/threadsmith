@@ -37,6 +37,7 @@ def neuro_kb(active: bool, mode: str) -> InlineKeyboardMarkup:
             callback_data="nc:mode")],
         [InlineKeyboardButton(text="🎚 Кэп в день", callback_data="nc:cap"),
          InlineKeyboardButton(text="📊 Статистика", callback_data="nc:stats")],
+        [InlineKeyboardButton(text="🏠 Главная", callback_data="home")],
     ])
 
 

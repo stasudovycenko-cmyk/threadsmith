@@ -57,11 +57,34 @@ async def _plan_for_user(uid, per_day, niche, keywords, acc_id):
         row = (await s.execute(text("""
             SELECT count(*) FROM scheduled_posts
             WHERE user_id = :uid
-              AND run_at::date = (now() at time zone 'utc')::date
+              AND run_at >= date_trunc('day', now() at time zone 'utc')
               AND status IN ('pending','publishing','done')
         """), {"uid": uid})).first()
         already = row[0]
         profile = await scenarist.get_voice(s, uid)
+        trow = (await s.execute(text(
+            "SELECT topics FROM autocontent_settings WHERE user_id = :uid"
+        ), {"uid": uid})).first()
+        topics = [t.strip() for t in ((trow[0] if trow else "") or "").splitlines() if t.strip()]
+        srow = (await s.execute(text(
+            "SELECT slots, days FROM autocontent_settings WHERE user_id = :uid"
+        ), {"uid": uid})).first()
+        slots = [int(x) for x in ((srow[0] if srow else "") or "").split(",")
+                 if x.strip().isdigit()] or SLOTS
+        days = (srow[1] if srow else "") or "all"
+        trow2 = (await s.execute(text(
+            "SELECT count(*) FROM scheduled_posts WHERE user_id = :uid"
+        ), {"uid": uid})).first()
+        total_posts = trow2[0] if trow2 else 0
+        rrows = (await s.execute(text(
+            "SELECT text FROM scheduled_posts WHERE user_id = :uid "
+            "ORDER BY id DESC LIMIT 8"
+        ), {"uid": uid})).all()
+        recent = [r[0] for r in rrows if r[0]]
+        grow = (await s.execute(text(
+            "SELECT coalesce(goal,'') FROM autocontent_settings WHERE user_id = :uid"
+        ), {"uid": uid})).first()
+        goal_key = grow[0] if grow else ""
 
     need = max(0, per_day - already)
     if need == 0 or not profile:
@@ -72,7 +95,10 @@ async def _plan_for_user(uid, per_day, niche, keywords, acc_id):
 
     for i in range(need):
         # тема = ниша + случайный ключевик, для разнообразия
-        topic = f"{niche}: {random.choice(kws)}"
+        if topics:
+            topic = topics[(total_posts + i) % len(topics)]
+        else:
+            topic = f"{niche}: {random.choice(kws)}"
         cost = CREDIT_COSTS["generate_post"]
 
         async with Session() as s:
@@ -96,14 +122,19 @@ async def _plan_for_user(uid, per_day, niche, keywords, acc_id):
         hooks = out.get("hooks", [])
         hook = hooks[0]["text"] if hooks else ""
         body = out.get("body", "")
-        post_text = (hook + "\n\n" + body).strip()[:500]
+        post_text = scenarist.trim_post(hook + chr(10) + chr(10) + body)
 
         # время: ближайший свободный слот сегодня/завтра
-        slot_hour = SLOTS[(already + i) % len(SLOTS)]
+        slot_idx = already + i
+        slot_hour = slots[slot_idx % len(slots)]
+        day_offset = slot_idx // len(slots)
         run_at = now.replace(hour=slot_hour, minute=random.randint(0, 59),
-                             second=0, microsecond=0)
+                             second=0, microsecond=0) + timedelta(days=day_offset)
         if run_at < now + timedelta(minutes=10):
             run_at = run_at + timedelta(days=1)
+        if days == "weekdays":
+            while run_at.weekday() >= 5:
+                run_at = run_at + timedelta(days=1)
 
         async with Session() as s:
             await s.execute(text("""

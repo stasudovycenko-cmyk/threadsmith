@@ -296,6 +296,3 @@ async def threads_oauth_start(request: Request):
     log.info("threads oauth start state=%s redirect=%s", state, url)
 
     return RedirectResponse(url=url, status_code=302)
-
-from app.api.legal import router as legal_router
-app.include_router(legal_router)
