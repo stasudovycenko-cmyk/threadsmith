@@ -12,6 +12,7 @@ import logging
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.ai_cost import AIUsageContext
 from app.core.context_builder import estimate_text_tokens
 from app.core.llm import LLM_MAX_TOKENS, ask_json
 from app.schemas.llm import (
@@ -245,14 +246,20 @@ async def get_voice(session: AsyncSession, user_id: int) -> dict | None:
     return profile
 
 
-async def build_voice_profile(session: AsyncSession, user_id: int,
-                              posts: list[str]) -> dict:
+async def build_voice_profile(
+    session: AsyncSession,
+    user_id: int,
+    posts: list[str],
+    *,
+    usage_context: AIUsageContext | None = None,
+) -> dict:
     response = await ask_json(
         VOICE_SYSTEM,
         "Посты автора:\n\n" + "\n\n---\n\n".join(posts),
         max_tokens=LLM_MAX_TOKENS["voice_profile"],
         response_model=VoiceProfileResponse,
         feature="voice_profile",
+        usage_context=usage_context or AIUsageContext(user_id=user_id),
     )
     profile = response.model_dump(mode="json")
     await session.execute(text("""
@@ -275,6 +282,7 @@ async def generate_post(
     *,
     feature: str = "generate_post",
     brain: BrainTaskContext | None = None,
+    usage_context: AIUsageContext | None = None,
 ) -> dict:
     """Тема или референс -> {hooks: [3 варианта], body}."""
     nl = chr(10)
@@ -314,29 +322,42 @@ async def generate_post(
         ),
         response_model=PostGenerationResponse,
         feature=feature,
+        usage_context=usage_context,
     )
 
     return response.model_dump(mode="json")
 
 
-async def rewrite_post(profile: dict, source: str) -> dict:
+async def rewrite_post(
+    profile: dict,
+    source: str,
+    *,
+    usage_context: AIUsageContext | None = None,
+) -> dict:
     response = await ask_json(
         REWRITE_SYSTEM_TMPL.format(profile=_profile_str(profile), hooks=_HOOKS_TEXT),
         f"Исходный пост:\n{source}",
         max_tokens=LLM_MAX_TOKENS["rewrite"],
         response_model=PostGenerationResponse,
         feature="rewrite",
+        usage_context=usage_context,
     )
     return response.model_dump(mode="json")
 
 
-async def generate_thread(profile: dict, topic: str) -> dict:
+async def generate_thread(
+    profile: dict,
+    topic: str,
+    *,
+    usage_context: AIUsageContext | None = None,
+) -> dict:
     response = await ask_json(
         THREAD_SYSTEM_TMPL.format(profile=_profile_str(profile)),
         f"Тема ветки: {topic}",
         max_tokens=LLM_MAX_TOKENS["generate_thread"],
         response_model=ThreadGenerationResponse,
         feature="generate_thread",
+        usage_context=usage_context,
     )
     return response.model_dump(mode="json")
 

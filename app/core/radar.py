@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.ai_cost import AIUsageContext
 from app.core.crypto import decrypt_token
 from app.core.llm import LLM_MAX_TOKENS, ask_json
 from app.core.threads_api import keyword_search
@@ -134,7 +135,12 @@ JSON:
 }"""
 
 
-async def razbor(session: AsyncSession, post_id: str) -> dict:
+async def razbor(
+    session: AsyncSession,
+    post_id: str,
+    *,
+    usage_context: AIUsageContext | None = None,
+) -> dict:
     row = (await session.execute(text(
         "SELECT text FROM posts_library WHERE threads_post_id = :pid"
     ), {"pid": post_id})).first()
@@ -149,6 +155,7 @@ async def razbor(session: AsyncSession, post_id: str) -> dict:
         max_tokens=LLM_MAX_TOKENS["radar_analysis"],
         response_model=RadarAnalysisResponse,
         feature="radar_analysis",
+        usage_context=usage_context,
     )
     result = response.model_dump(mode="json")
     await session.execute(text("""

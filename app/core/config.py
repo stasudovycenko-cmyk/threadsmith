@@ -2,6 +2,8 @@
 Конфиг. Всё из env, валидация на старте — если чего-то нет, падаем сразу,
 а не в проде посреди ночи.
 """
+from decimal import Decimal
+
 from pydantic_settings import BaseSettings
 
 
@@ -22,6 +24,12 @@ class Settings(BaseSettings):
 
     # LLM
     ANTHROPIC_API_KEY: str = ""
+    AI_ENABLED: bool = True
+    AI_AUTOCONTENT_ENABLED: bool = True
+    AI_NEURO_ENABLED: bool = True
+    AI_RADAR_ENABLED: bool = True
+    AI_USER_DAILY_USD_LIMIT: Decimal = Decimal("3.00")
+    AI_ACCOUNT_DAILY_USD_LIMIT: Decimal = Decimal("2.00")
 
     # Робокасса
     ROBOKASSA_LOGIN: str

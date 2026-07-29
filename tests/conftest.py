@@ -1,7 +1,7 @@
 import os
 
 _TEST_ENV = {
-    "BOT_TOKEN": "test-bot-token",
+    "BOT_TOKEN": "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
     "DATABASE_URL": "postgresql+asyncpg://test:test@localhost/test",
     "THREADS_APP_ID": "test-app-id",
     "THREADS_APP_SECRET": "test-app-secret",

@@ -10,15 +10,22 @@
 """
 import logging
 import random
+import uuid
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import text
 
 from app.core import neuro
+from app.core.ai_cost import (
+    AIUsageContext,
+    NEURO_MAX_CANDIDATES_PER_RUN,
+    NEURO_MAX_LLM_CALLS_PER_RUN,
+)
 from app.core.config import settings
 from app.core.crypto import decrypt_token
 from app.core.db import Session
+from app.core.llm import LLMGuardError
 from app.core.threads_api import create_container, publish_container
 
 log = logging.getLogger("m4_jobs")
@@ -48,30 +55,68 @@ async def neuro_hunter():
             continue
         try:
             await _hunt_for_user(uid, mode, cap, niche, profile,
-                                 threads_uid, tok_enc, tg_id)
+                                 threads_uid, tok_enc, tg_id,
+                                 acc_id=acc_id)
         except Exception:
             log.exception("neuro_hunter failed uid=%s", uid)
 
 
 async def _hunt_for_user(uid, mode, cap, niche, profile,
-                         threads_uid, tok_enc, tg_id):
+                         threads_uid, tok_enc, tg_id, *,
+                         acc_id=None):
     async with Session() as s:
         done_today = await neuro.today_count(s, uid)
         if done_today >= cap:
             return
-        candidates = await neuro.pick_candidates(s, uid, niche)
+        candidates = await neuro.pick_candidates(
+            s,
+            uid,
+            niche,
+            limit=NEURO_MAX_CANDIDATES_PER_RUN,
+        )
 
     budget = min(2, cap - done_today)  # не больше 2 за прогон
     posted = 0
+    llm_calls = 0
+    usage_context = AIUsageContext(
+        user_id=uid,
+        threads_account_id=acc_id,
+        run_id=f"neuro:{uuid.uuid4().hex}:{uid}:{acc_id or 'none'}",
+    )
 
     for post_id, author, post_text in candidates:
         if posted >= budget:
+            break
+        if llm_calls >= NEURO_MAX_LLM_CALLS_PER_RUN:
+            log.warning(
+                "neuro run cap uid=%s account=%s calls=%s limit=%s",
+                uid,
+                acc_id,
+                llm_calls,
+                NEURO_MAX_LLM_CALLS_PER_RUN,
+            )
             break
         async with Session() as s:
             if await neuro.author_commented_today(s, uid, author):
                 continue
 
-        result = await neuro.generate_comment(profile, niche, post_text, author)
+        llm_calls += 1
+        try:
+            result = await neuro.generate_comment(
+                profile,
+                niche,
+                post_text,
+                author,
+                usage_context=usage_context,
+            )
+        except LLMGuardError as error:
+            log.warning(
+                "neuro AI guard stop uid=%s account=%s reason=%s",
+                uid,
+                acc_id,
+                error,
+            )
+            return
         if not result.get("relevant") or not result.get("comment"):
             log.info("neuro skip uid=%s post=%s: %s",
                      uid, post_id, result.get("skip_reason"))
