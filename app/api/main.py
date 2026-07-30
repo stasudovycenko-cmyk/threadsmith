@@ -33,8 +33,20 @@ bot = Bot(settings.BOT_TOKEN)
 async def threads_callback(request: Request):
     code = request.query_params.get("code")
     state = request.query_params.get("state")
+
     if not code or not state:
-        return HTMLResponse("<h3>Ошибка авторизации. Вернись в бот и попробуй ещё раз.</h3>")
+        return HTMLResponse(
+            "<h3>Ошибка авторизации. Вернись в бот и попробуй ещё раз.</h3>",
+            status_code=400,
+        )
+
+    try:
+        state = str(UUID(state))
+    except (ValueError, TypeError):
+        return HTMLResponse(
+            "<h3>Некорректная ссылка авторизации.</h3>",
+            status_code=400,
+        )
 
     async with Session() as s:
         row = (await s.execute(text("""
