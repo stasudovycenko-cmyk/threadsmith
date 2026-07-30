@@ -10,6 +10,7 @@ API независимы, общего состояния нет.
 """
 import logging
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
 from aiogram import Bot
 from fastapi import FastAPI, Request
@@ -270,6 +271,14 @@ async def threads_oauth_start(request: Request):
     if not state:
         return HTMLResponse(
             "<h3>Не передан state. Вернитесь в Telegram и попробуйте заново.</h3>",
+            status_code=400,
+        )
+
+    try:
+        state = str(UUID(state))
+    except (ValueError, TypeError):
+        return HTMLResponse(
+            "<h3>Некорректная ссылка авторизации.</h3>",
             status_code=400,
         )
 
