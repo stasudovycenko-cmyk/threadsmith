@@ -64,6 +64,22 @@ class ContentQuality(ContentModel):
     goal_fit: float = Field(ge=0, le=1)
 
 
+class ContentDraftHook(ContentModel):
+    """Minimal hook shape produced by the LLM."""
+
+    type: HookType
+    text: str = Field(min_length=1)
+
+
+class ContentGenerationDraft(ContentModel):
+    """Private low-token response before deterministic canonicalization."""
+
+    hooks: list[ContentDraftHook] = Field(min_length=3, max_length=3)
+    body: str
+    selected_hook_index: int = Field(ge=0, le=2)
+    specificity: float = Field(ge=0, le=1)
+
+
 class ContentMetadata(ContentModel):
     goal: str
     angle: ContentAngle

@@ -21,6 +21,7 @@ from app.core.content_engine import (
 from app.core.llm import LLMGuardError
 from app.schemas.content_engine import (
     ContentBrief,
+    ContentGenerationDraft,
     ContentGenerationResponse,
 )
 from app.schemas.social_brain import BrainTaskContext
@@ -85,6 +86,28 @@ def content_response(
             "voice_match": 0.8,
             "goal_fit": 0.8,
         },
+    )
+
+
+def draft_response(
+    *,
+    body: str = (
+        "Specific evidence and a useful conclusion make this draft concrete "
+        "enough for publication."
+    ),
+    opening: str = "A concrete opening worth reading",
+    selected_index: int = 0,
+    specificity: float = 0.8,
+) -> ContentGenerationDraft:
+    return ContentGenerationDraft(
+        hooks=[
+            {"type": "insight", "text": opening},
+            {"type": "pain", "text": "This familiar mistake has a cost"},
+            {"type": "number", "text": "Three signals reveal the problem"},
+        ],
+        body=body,
+        selected_hook_index=selected_index,
+        specificity=specificity,
     )
 
 
@@ -156,6 +179,19 @@ def test_content_brief_schema_is_typed_and_compact():
     assert brief.pattern_hints == []
     with pytest.raises(ValidationError):
         ContentBrief(goal="reach", topic="x", unexpected="value")
+
+
+def test_compact_generation_draft_requires_exactly_three_hooks():
+    with pytest.raises(ValidationError):
+        ContentGenerationDraft(
+            hooks=[
+                {"type": "insight", "text": "One"},
+                {"type": "pain", "text": "Two"},
+            ],
+            body="A complete body",
+            selected_hook_index=0,
+            specificity=0.8,
+        )
 
 
 def test_reach_goal_selects_views_patterns():
@@ -251,7 +287,7 @@ def test_mature_pattern_metadata_is_preserved():
     assert plan.pattern_ids == (91,)
     assert plan.pattern_keys == ("hook_type:insight:views",)
     assert "preference hint, not a rule" in plan.brief.pattern_hints[0]
-    assert "posts_analyzed" in plan.brief.performance_context
+    assert plan.brief.performance_context == "views,n=12"
 
 
 @pytest.mark.parametrize(
@@ -369,6 +405,16 @@ def test_anti_repeat_detects_similar_opening():
     assert repeated_reason(response, memory) == "repeated_opening_similar"
 
 
+def test_anti_repeat_gate_checks_memory_beyond_prompt_window():
+    response = content_response(opening="The sixth opening still matters")
+    memory = [
+        ContentMemoryItem(opening=f"Unrelated opening {index}")
+        for index in range(5)
+    ]
+    memory.append(ContentMemoryItem(opening="The sixth opening still matters"))
+    assert repeated_reason(response, memory) == "repeated_opening_exact"
+
+
 def test_different_angle_and_opening_are_allowed():
     response = content_response(
         opening="A fresh comparison changes the decision",
@@ -398,6 +444,15 @@ def test_deterministic_quality_gate_fails_with_reasons():
     assert "repeated_opening_exact" in gate.reasons
 
 
+def test_quality_gate_keeps_banned_phrase_and_length_checks():
+    banned = quality_gate(content_response(
+        body="Вот что понял: конкретный вывод с достаточной длиной текста.",
+    ))
+    too_long = quality_gate(content_response(body="x" * 500))
+    assert "banned_phrase" in banned.reasons
+    assert "post_too_long" in too_long.reasons
+
+
 def test_deterministic_quality_gate_passes_publishable_content():
     assert quality_gate(content_response()).passed
 
@@ -407,7 +462,7 @@ def test_selected_hook_and_metadata_are_canonicalized(monkeypatch):
 
     async def fake_ask_json(_system, _user, **kwargs):
         calls.append(kwargs)
-        return content_response(selected_index=1)
+        return draft_response(selected_index=1)
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     result = asyncio.run(scenarist.generate_post(
@@ -424,7 +479,7 @@ def test_selected_hook_and_metadata_are_canonicalized(monkeypatch):
     assert result["metadata"]["selected_hook"] == result["hooks"][1]["text"]
     assert result["metadata"]["user_id"] == 7
     assert result["metadata"]["threads_account_id"] == 11
-    assert calls[0]["response_model"] is ContentGenerationResponse
+    assert calls[0]["response_model"] is ContentGenerationDraft
 
 
 def test_generation_uses_cost_engine_feature_and_one_normal_call(monkeypatch):
@@ -432,7 +487,7 @@ def test_generation_uses_cost_engine_feature_and_one_normal_call(monkeypatch):
 
     async def fake_ask_json(_system, _user, **kwargs):
         calls.append(kwargs)
-        return content_response()
+        return draft_response()
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     result = asyncio.run(scenarist.generate_post({}, "AI workflows"))
@@ -443,8 +498,8 @@ def test_generation_uses_cost_engine_feature_and_one_normal_call(monkeypatch):
 def test_repair_uses_cost_engine_and_runs_at_most_once(monkeypatch):
     calls = []
     responses = [
-        content_response(body="x" * 500),
-        content_response(),
+        draft_response(body="x" * 500),
+        draft_response(),
     ]
 
     async def fake_ask_json(_system, user, **kwargs):
@@ -461,12 +516,35 @@ def test_repair_uses_cost_engine_and_runs_at_most_once(monkeypatch):
     assert "post_too_long" in calls[1][0]
 
 
+def test_engagement_cta_policy_survives_compact_response(monkeypatch):
+    responses = [
+        draft_response(),
+        draft_response(body=(
+            "Конкретный вывод из эксперимента. Напиши в комментариях, "
+            "какой подход сработал у тебя."
+        )),
+    ]
+
+    async def fake_ask_json(*_args, **_kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
+    result = asyncio.run(scenarist.generate_post(
+        {},
+        "AI workflows",
+        brain=brain_context("engagement"),
+    ))
+    assert result["metadata"]["pipeline_stage"] == "repair"
+    assert result["metadata"]["has_cta"] is True
+    assert result["metadata"]["cta_type"] == "comment"
+
+
 def test_second_quality_failure_stops_after_one_repair(monkeypatch):
     calls = []
 
     async def fake_ask_json(_system, _user, **kwargs):
         calls.append(kwargs["feature"])
-        return content_response(body="x" * 500)
+        return draft_response(body="x" * 500)
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     with pytest.raises(scenarist.ContentQualityError):
@@ -481,7 +559,7 @@ def test_budget_guard_blocks_repair_without_fallback_call(monkeypatch):
         calls.append(kwargs["feature"])
         if kwargs["feature"] == "content_repair":
             raise LLMGuardError("budget exhausted")
-        return content_response(body="x" * 500)
+        return draft_response(body="x" * 500)
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     with pytest.raises(LLMGuardError, match="budget exhausted"):
@@ -493,7 +571,7 @@ def test_old_generate_post_caller_and_public_shape_remain_compatible(
     monkeypatch,
 ):
     async def fake_ask_json(*_args, **_kwargs):
-        return content_response()
+        return draft_response()
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     result = asyncio.run(scenarist.generate_post(
@@ -509,7 +587,7 @@ def test_old_generate_post_caller_and_public_shape_remain_compatible(
 
 def test_renderer_ignores_additional_content_engine_fields(monkeypatch):
     async def fake_ask_json(*_args, **_kwargs):
-        return content_response()
+        return draft_response()
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     result = asyncio.run(scenarist.generate_post({}, "AI workflows"))
@@ -523,7 +601,7 @@ def test_autocontent_uses_same_engine_and_preserves_metadata(monkeypatch):
 
     async def fake_ask_json(_system, _user, **kwargs):
         calls.append(kwargs["feature"])
-        return content_response()
+        return draft_response()
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     result = asyncio.run(scenarist.generate_post(
@@ -593,7 +671,7 @@ def test_missing_brain_falls_back_to_compact_plan(monkeypatch):
             raise RuntimeError("unavailable")
 
     async def fake_ask_json(*_args, **_kwargs):
-        return content_response()
+        return draft_response()
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     result = asyncio.run(scenarist.generate_post(
@@ -607,7 +685,7 @@ def test_missing_brain_falls_back_to_compact_plan(monkeypatch):
 
 def test_new_prompt_growth_stays_within_target(monkeypatch, caplog):
     async def fake_ask_json(*_args, **_kwargs):
-        return content_response()
+        return draft_response()
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     with caplog.at_level(logging.INFO, logger="scenarist"):
@@ -620,5 +698,10 @@ def test_new_prompt_growth_stays_within_target(monkeypatch, caplog):
         for record in caplog.records
         if record.getMessage().startswith("content_engine_prompt_sizes")
     )
-    delta = float(re.search(r"delta_percent=([-0-9.]+)", message).group(1))
-    assert delta <= 35.0
+    delta = float(
+        re.search(
+            r"delta_vs_legacy_percent=([-0-9.]+)",
+            message,
+        ).group(1)
+    )
+    assert delta <= 15.0
