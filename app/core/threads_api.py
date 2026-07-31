@@ -14,6 +14,7 @@ Threads API: OAuth-флоу + обёртка над graph.threads.net.
 """
 import asyncio
 import httpx
+import re
 from urllib.parse import urlencode
 
 from app.core.config import settings
@@ -22,10 +23,23 @@ AUTH_URL = "https://threads.net/oauth/authorize"
 BASE = "https://graph.threads.net"
 
 SCOPES = "threads_basic,threads_content_publish,threads_manage_insights,threads_manage_replies,threads_keyword_search"
+_SENSITIVE_RESPONSE_RE = re.compile(
+    r"(?i)(access_token|refresh_token|client_secret|app_secret|bot_token)"
+    r"([\"'\s:=]+)([^,\"'\s&}]+)"
+)
 
 
 class ThreadsAPIError(RuntimeError):
     """Threads API error without secrets from request query params."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+    ):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def _safe_response_error(response: httpx.Response) -> ThreadsAPIError:
@@ -36,6 +50,10 @@ def _safe_response_error(response: httpx.Response) -> ThreadsAPIError:
         body = response.text.strip()
     except Exception:
         body = ""
+    body = _SENSITIVE_RESPONSE_RE.sub(
+        r"\1\2<redacted>",
+        body,
+    )
 
     # Не тащим гигантский body в логи/БД.
     if len(body) > 800:
@@ -45,7 +63,7 @@ def _safe_response_error(response: httpx.Response) -> ThreadsAPIError:
     if body:
         detail += f": {body}"
 
-    return ThreadsAPIError(detail)
+    return ThreadsAPIError(detail, status_code=response.status_code)
 
 
 def _raise_for_status_safe(response: httpx.Response) -> None:

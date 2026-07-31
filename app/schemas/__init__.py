@@ -1,5 +1,13 @@
 """Typed schemas used at application boundaries."""
 
+from app.schemas.autopost import (
+    AutopostAccount,
+    AutopostErrorCode,
+    AutopostRun,
+    AutopostRunStatus,
+    AutopostSettings,
+    AutopostStatus,
+)
 from app.schemas.content_engine import (
     ContentAngle,
     ContentBrief,
@@ -36,6 +44,12 @@ from app.schemas.social_brain import (
 )
 
 __all__ = [
+    "AutopostAccount",
+    "AutopostErrorCode",
+    "AutopostRun",
+    "AutopostRunStatus",
+    "AutopostSettings",
+    "AutopostStatus",
     "ContentAngle",
     "ContentBrief",
     "ContentFormat",
