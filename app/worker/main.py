@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import text
 
+from app.core.autopost_status import recover_autopost_state
 from app.core.crypto import decrypt_token, encrypt_token
 from app.core.db import Session
 from app.core.threads_api import refresh_long_lived
@@ -48,16 +49,47 @@ async def token_refresher():
         await s.commit()
 
 
-async def main():
-    sched = AsyncIOScheduler()
-    sched.add_job(token_refresher, "interval", hours=12)
-    sched.add_job(publisher, "interval", minutes=1, max_instances=1)
+async def autopost_recovery_job():
+    async with Session() as session:
+        result = await recover_autopost_state(session)
+        await session.commit()
+    if any(result.values()):
+        log.warning("autopost recovery result=%s", result)
+    return result
+
+
+def build_scheduler() -> AsyncIOScheduler:
+    scheduler = AsyncIOScheduler(
+        timezone=timezone.utc,
+        job_defaults={
+            "coalesce": True,
+            "misfire_grace_time": 60,
+            "max_instances": 1,
+        },
+    )
+    scheduler.add_job(token_refresher, "interval", hours=12)
+    scheduler.add_job(
+        publisher,
+        "interval",
+        minutes=1,
+        misfire_grace_time=30,
+    )
     # comment_poller disabled until threads_manage_replies is approved by Meta
-    sched.add_job(library_crawler, "interval", hours=1, max_instances=1)
-    sched.add_job(neuro_hunter, "interval", minutes=20, max_instances=1)
-    sched.add_job(autocontent_planner, "interval", hours=1, max_instances=1)
-    sched.add_job(insights_snapshotter, "cron", hour=3, minute=30)
-    sched.add_job(
+    scheduler.add_job(library_crawler, "interval", hours=1)
+    scheduler.add_job(neuro_hunter, "interval", minutes=20)
+    scheduler.add_job(
+        autocontent_planner,
+        "interval",
+        minutes=5,
+        next_run_time=datetime.now(timezone.utc),
+    )
+    scheduler.add_job(
+        autopost_recovery_job,
+        "interval",
+        minutes=5,
+    )
+    scheduler.add_job(insights_snapshotter, "cron", hour=3, minute=30)
+    scheduler.add_job(
         feedback_loop_job,
         "cron",
         hour=4,
@@ -65,6 +97,14 @@ async def main():
         max_instances=1,
         coalesce=True,
     )
+    return scheduler
+
+
+async def main():
+    recovery = await autopost_recovery_job()
+    log.info("autopost recovery complete result=%s", recovery)
+
+    sched = build_scheduler()
     sched.start()
     log.info("worker started")
     await asyncio.Event().wait()

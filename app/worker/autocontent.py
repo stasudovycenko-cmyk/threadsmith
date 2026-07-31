@@ -1,10 +1,10 @@
 """
-Авто-контент для Автопилота. Джоба крутится раз в час.
+Авто-контент для Автопилота. Джоба крутится раз в пять минут.
 
 Для каждого юзера, у кого включён авто-контент (autocontent_settings.active):
   1. Смотрим, сколько постов уже стоит в очереди на сегодня.
   2. Если меньше плана (posts_per_day) — генерим недостающие Сценаристом
-     его голосом по его нише и ставим в scheduled_posts на разное время.
+     его голосом по его нише и ставим в scheduled_posts на точные slots.
 
 Требует: обученный голос + заданная ниша + подключённый Threads.
 Списывает кредиты как обычная генерация (generate_post). Нет кредитов —
@@ -17,7 +17,7 @@ import json
 import logging
 import random
 import uuid
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import datetime, timezone
 
 from sqlalchemy import text
 
@@ -29,6 +29,15 @@ from app.core.ai_cost import (
     AUTOCONTENT_MAX_POSTS_PER_USER_DAY,
     AIUsageContext,
 )
+from app.core.autopost_status import (
+    AutopostStatusService,
+    DEFAULT_TIMEZONE,
+    SAFE_ERROR_MESSAGES,
+    ensure_aware,
+    normalize_error,
+    parse_slots,
+    select_next_slots,
+)
 from app.core.config import CREDIT_COSTS
 from app.core.content_engine import ContentMemoryRepo
 from app.core.db import Session
@@ -36,28 +45,23 @@ from app.core.llm import LLMGuardError
 
 log = logging.getLogger("autocontent")
 
-MSK = timezone(timedelta(hours=3))
-# в какие часы (мск) раскидывать авто-посты
-SLOTS = [9, 12, 15, 18, 21]
-
 
 async def autocontent_planner():
     async with Session() as s:
         users = (await s.execute(text("""
             SELECT ac.user_id, ac.posts_per_day,
                    un.niche, un.keywords,
-                   ta.id
+                   ta.id, ta.expires_at
             FROM autocontent_settings ac
             JOIN user_niches un ON un.user_id = ac.user_id
             JOIN voice_profiles vp ON vp.user_id = ac.user_id
             JOIN threads_accounts ta ON ta.user_id = ac.user_id
-                 AND ta.expires_at > now()
             WHERE ac.active
         """))).all()
 
     planner_run_id = uuid.uuid4().hex
     remaining = AUTOCONTENT_MAX_GENERATIONS_PER_PLANNER_RUN
-    for uid, per_day, niche, keywords, acc_id in users:
+    for uid, per_day, niche, keywords, acc_id, expires_at in users:
         if remaining <= 0:
             log.warning(
                 "autocontent cap stop run_id=%s generated=%s limit=%s",
@@ -73,56 +77,18 @@ async def autocontent_planner():
                 niche,
                 keywords,
                 acc_id,
+                account_expires_at=expires_at,
                 planner_run_id=planner_run_id,
                 max_generations=remaining,
             )
             remaining -= generated
-        except Exception:
-            log.exception("autocontent failed uid=%s", uid)
-
-
-def _target_day(now: datetime, slots: list[int], days: str) -> date | None:
-    earliest = now + timedelta(minutes=10)
-    for offset in range(8):
-        candidate = now.date() + timedelta(days=offset)
-        if days == "weekdays" and candidate.weekday() >= 5:
-            continue
-        if any(
-            datetime.combine(
-                candidate,
-                time(hour=hour, minute=59),
-                tzinfo=MSK,
-            ) >= earliest
-            for hour in slots
-        ):
-            return candidate
-    return None
-
-
-def _available_slot_times(
-    target_day: date,
-    slots: list[int],
-    occupied_hours: set[int],
-    now: datetime,
-) -> list[datetime]:
-    earliest = now + timedelta(minutes=10)
-    available = []
-    for hour in slots:
-        if hour in occupied_hours:
-            continue
-        first_minute = 0
-        if target_day == now.date() and hour == now.hour:
-            first_minute = now.minute + 11
-        if first_minute > 59:
-            continue
-        run_at = datetime.combine(
-            target_day,
-            time(hour=hour, minute=random.randint(first_minute, 59)),
-            tzinfo=MSK,
-        )
-        if run_at >= earliest:
-            available.append(run_at)
-    return available
+        except Exception as exc:
+            log.error(
+                "autocontent failed uid=%s account=%s error_type=%s",
+                uid,
+                acc_id,
+                type(exc).__name__,
+            )
 
 
 def _bounded_generation_count(
@@ -148,6 +114,7 @@ async def _plan_for_user(
     keywords,
     acc_id,
     *,
+    account_expires_at: datetime | None = None,
     planner_run_id: str | None = None,
     max_generations: int = AUTOCONTENT_MAX_GENERATIONS_PER_USER_RUN,
 ) -> int:
@@ -171,24 +138,24 @@ async def _plan_for_user(
     async with Session() as s:
         profile = await scenarist.get_voice(s, uid)
         settings_row = (await s.execute(text(
-            "SELECT topics, slots, days, coalesce(goal,'') "
+            "SELECT topics, slots, days, coalesce(goal,''), "
+            "coalesce(timezone, :default_timezone) "
             "FROM autocontent_settings WHERE user_id = :uid"
-        ), {"uid": uid})).first()
-        topics_raw, slots_raw, days, goal_key = (
+        ), {
+            "uid": uid,
+            "default_timezone": DEFAULT_TIMEZONE,
+        })).first()
+        topics_raw, slots_raw, days, goal_key, timezone_name = (
             settings_row
             if settings_row
-            else ("", "", "all", "")
+            else ("", "", "all", "", DEFAULT_TIMEZONE)
         )
         topics = [
             item.strip()
             for item in (topics_raw or "").splitlines()
             if item.strip()
         ]
-        slots = sorted({
-            int(item)
-            for item in (slots_raw or "").split(",")
-            if item.strip().isdigit() and 0 <= int(item) <= 23
-        }) or SLOTS
+        slots = parse_slots(slots_raw)
         days = days or "all"
         trow2 = (await s.execute(text(
             "SELECT count(*) FROM scheduled_posts "
@@ -256,50 +223,24 @@ async def _plan_for_user(
         return 0
 
     kws = keywords or [niche]
-    now = datetime.now(MSK)
-    target_day = _target_day(now, slots, days)
-    if target_day is None:
-        log.warning("autocontent no eligible day uid=%s", uid)
-        return 0
-    day_start = datetime.combine(target_day, time.min, tzinfo=MSK)
-    day_end = day_start + timedelta(days=1)
+    now = datetime.now(timezone.utc)
     async with Session() as s:
-        scheduled_rows = (await s.execute(text("""
-            SELECT run_at FROM scheduled_posts
-            WHERE user_id = :uid
-              AND threads_account_id = :acc
-              AND run_at >= :day_start
-              AND run_at < :day_end
-              AND status IN ('pending','publishing','done')
-        """), {
-            "uid": uid,
-            "acc": acc_id,
-            "day_start": day_start,
-            "day_end": day_end,
-        })).all()
-    already = len(scheduled_rows)
-    occupied_hours = {
-        row[0].astimezone(MSK).hour
-        for row in scheduled_rows
-        if row[0] is not None
-    }
-    need = max(0, per_day - already)
-    if need > AUTOCONTENT_MAX_GENERATIONS_PER_USER_RUN:
-        log.warning(
-            "autocontent absurd need uid=%s need=%s limit=%s",
+        occupied = await AutopostStatusService(s).occupied_slots(
             uid,
-            need,
-            AUTOCONTENT_MAX_GENERATIONS_PER_USER_RUN,
+            acc_id,
+            now=now,
+            timezone_name=timezone_name,
         )
-        return 0
-    available_times = _available_slot_times(
-        target_day,
-        slots,
-        occupied_hours,
-        now,
+    available_times = select_next_slots(
+        now=now,
+        slots=slots,
+        days=days,
+        timezone_name=timezone_name,
+        posts_per_day=per_day,
+        occupied=occupied,
     )
     generation_count = _bounded_generation_count(
-        need=need,
+        need=len(available_times),
         max_generations=max_generations,
         pending_count=pending_count,
         available_slots=len(available_times),
@@ -317,6 +258,33 @@ async def _plan_for_user(
         ),
     )
     for i in range(generation_count):
+        run_at = available_times[i]
+        async with Session() as s:
+            run_id = await AutopostStatusService(s).reserve_run(
+                uid,
+                acc_id,
+                run_at,
+            )
+            await s.commit()
+        if run_id is None:
+            continue
+
+        if (
+            account_expires_at is not None
+            and ensure_aware(account_expires_at) <= now
+        ):
+            async with Session() as s:
+                await AutopostStatusService(s).finish_run(
+                    run_id,
+                    status="skipped",
+                    error_code="AUTH_EXPIRED",
+                    safe_error_message=SAFE_ERROR_MESSAGES[
+                        "AUTH_EXPIRED"
+                    ],
+                )
+                await s.commit()
+            continue
+
         # тема = ниша + случайный ключевик, для разнообразия
         if topics:
             topic = topics[(total_posts + i) % len(topics)]
@@ -329,8 +297,18 @@ async def _plan_for_user(
                 await credits.spend(s, uid, cost, "autocontent")
                 await s.commit()
             except credits.NotEnoughCredits:
+                await s.rollback()
+                await AutopostStatusService(s).finish_run(
+                    run_id,
+                    status="skipped",
+                    error_code="INSUFFICIENT_CREDITS",
+                    safe_error_message=SAFE_ERROR_MESSAGES[
+                        "INSUFFICIENT_CREDITS"
+                    ],
+                )
+                await s.commit()
                 log.info("autocontent: нет кредитов uid=%s, стоп", uid)
-                return
+                return attempts
 
         try:
             attempts += 1
@@ -347,18 +325,44 @@ async def _plan_for_user(
         except LLMGuardError as error:
             async with Session() as s:
                 await credits.topup(s, uid, cost, "refund_autocontent")
+                code, message = normalize_error(
+                    error,
+                    stage="generation",
+                )
+                await AutopostStatusService(s).finish_run(
+                    run_id,
+                    status="failed",
+                    error_code=code,
+                    safe_error_message=message,
+                )
                 await s.commit()
             log.warning(
-                "autocontent AI guard stop uid=%s reason=%s",
+                "autocontent AI guard stop uid=%s error_type=%s",
                 uid,
-                error,
+                type(error).__name__,
             )
             return attempts
-        except Exception:
+        except Exception as error:
             async with Session() as s:
                 await credits.topup(s, uid, cost, "refund_autocontent")
+                code, message = normalize_error(
+                    error,
+                    stage="generation",
+                )
+                await AutopostStatusService(s).finish_run(
+                    run_id,
+                    status="failed",
+                    error_code=code,
+                    safe_error_message=message,
+                )
                 await s.commit()
-            log.exception("autocontent gen failed uid=%s", uid)
+            log.error(
+                "autocontent gen failed uid=%s account=%s "
+                "error_type=%s",
+                uid,
+                acc_id,
+                type(error).__name__,
+            )
             continue
 
         # собираем пост: выбранный хук + тело
@@ -372,28 +376,45 @@ async def _plan_for_user(
         post_text = scenarist.trim_post(hook + chr(10) + chr(10) + body)
         metadata = out.get("metadata") or {}
 
-        run_at = available_times[i]
-
         async with Session() as s:
-            await s.execute(text("""
+            row = (await s.execute(text("""
                 INSERT INTO scheduled_posts
                     (user_id, threads_account_id, text, run_at, status,
                      content_metadata)
-                VALUES (
+                SELECT
                     :uid, :acc, :txt, :run, 'pending',
                     CAST(:metadata AS jsonb)
+                WHERE EXISTS (
+                    SELECT 1 FROM autopost_runs
+                    WHERE id = :run_id
+                      AND status = 'pending'
                 )
+                RETURNING id
             """), {
                 "uid": uid,
                 "acc": acc_id,
                 "txt": post_text,
                 "run": run_at,
+                "run_id": run_id,
                 "metadata": json.dumps(
                     metadata,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ),
-            })
+            })).first()
+            if row is None:
+                await credits.topup(
+                    s,
+                    uid,
+                    cost,
+                    "refund_autocontent_disabled",
+                )
+                await s.commit()
+                continue
+            await AutopostStatusService(s).attach_post(
+                run_id,
+                row[0],
+            )
             await s.commit()
         log.info("autocontent: +пост uid=%s на %s", uid, run_at.isoformat())
     return attempts

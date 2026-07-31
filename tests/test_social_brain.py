@@ -1,7 +1,7 @@
 import asyncio
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -973,8 +973,14 @@ def test_publishing_event_only_after_success(monkeypatch):
     monkeypatch.setattr(autopilot, "create_container", fake_create)
     monkeypatch.setattr(autopilot, "publish_container", fake_publish)
     session = FakeSession([
+        [("publishing",)],
         [(0,)],
-        [("threads-user", b"encrypted")],
+        [(
+            "threads-user",
+            b"encrypted",
+            NOW + timedelta(days=30),
+        )],
+        [],
         [],
         [],
     ])
@@ -985,6 +991,13 @@ def test_publishing_event_only_after_success(monkeypatch):
     assert result[0] is True
     assert captured[0][0] == (7, 101)
     assert captured[0][1]["scheduled_post_id"] == 900
+    run_update = next(
+        params
+        for sql, params in session.calls
+        if "UPDATE autopost_runs" in sql
+    )
+    assert run_update["status"] == "success"
+    assert run_update["threads_post_id"] == "threads-post-1"
 
 
 def test_publishing_failure_does_not_record_event(monkeypatch):
@@ -1004,8 +1017,14 @@ def test_publishing_failure_does_not_record_event(monkeypatch):
     monkeypatch.setattr(autopilot, "decrypt_token", lambda _v: "token")
     monkeypatch.setattr(autopilot, "create_container", fail_create)
     session = FakeSession([
+        [("publishing",)],
         [(0,)],
-        [("threads-user", b"encrypted")],
+        [(
+            "threads-user",
+            b"encrypted",
+            NOW + timedelta(days=30),
+        )],
+        [],
         [],
     ])
     result = asyncio.run(autopilot.publish_one(
