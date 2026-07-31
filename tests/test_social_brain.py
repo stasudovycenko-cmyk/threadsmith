@@ -18,7 +18,7 @@ from app.core.context_builder import (
     PATTERN_MIN_SAMPLES,
     ContextBuilder,
 )
-from app.schemas.content_engine import ContentGenerationResponse
+from app.schemas.content_engine import ContentGenerationDraft
 from app.schemas.social_brain import (
     BrainPattern,
     BrainRecord,
@@ -270,51 +270,27 @@ def build_context(task="generation", budget=1000, repo=None):
 
 
 def llm_response():
-    return ContentGenerationResponse(
-        brief={
-            "goal": "reach",
-            "topic": "topic",
-            "angle": "observation",
-            "format": "observation",
-            "source": "manual",
-        },
+    return ContentGenerationDraft(
         hooks=[
             {
                 "type": "insight",
                 "text": "Concrete opening",
-                "intent": "stop the reader",
             },
             {
                 "type": "pain",
                 "text": "A costly mistake",
-                "intent": "name the pain",
             },
             {
                 "type": "number",
                 "text": "Three useful signals",
-                "intent": "promise specifics",
             },
         ],
         body=(
             "A concrete observation with enough detail to pass the "
             "deterministic quality gate."
         ),
-        metadata={
-            "goal": "reach",
-            "angle": "observation",
-            "hook_type": "insight",
-            "format": "observation",
-            "topic": "topic",
-            "has_cta": False,
-            "source": "manual",
-        },
-        quality={
-            "clarity": 0.8,
-            "hook_strength": 0.8,
-            "specificity": 0.8,
-            "voice_match": 0.8,
-            "goal_fit": 0.8,
-        },
+        selected_hook_index=0,
+        specificity=0.8,
     )
 
 
@@ -608,7 +584,7 @@ def test_scenarist_infers_only_unambiguous_single_account(
     ) is None
 
 
-def test_scenarist_legacy_prompt_is_unchanged_without_brain(
+def test_scenarist_uses_compact_prompt_without_brain(
     monkeypatch,
 ):
     captured = {}
@@ -621,12 +597,13 @@ def test_scenarist_legacy_prompt_is_unchanged_without_brain(
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     profile = {"tone": "direct", "taboo": ["fluff"]}
     asyncio.run(scenarist.generate_post(profile, "topic"))
-    legacy_system = scenarist.GEN_SYSTEM_TMPL.format(
+    compact_system = scenarist.CONTENT_GENERATION_SYSTEM_TMPL.format(
         profile=scenarist._profile_str(profile),
-        hooks=scenarist._HOOKS_TEXT,
     )
-    assert captured["system"].startswith(legacy_system)
-    assert "CONTENT_BRIEF_JSON:" in captured["user"]
+    assert captured["system"] == compact_system
+    assert "BRIEF:" in captured["user"]
+    assert "CONTENT_BRIEF_JSON:" not in captured["user"]
+    assert scenarist._HOOKS_TEXT not in captured["system"]
 
 
 def test_scenarist_adds_compact_brain_context(monkeypatch):
@@ -664,7 +641,7 @@ def test_scenarist_keeps_account_voice_facts(monkeypatch):
         "topic",
         brain=context,
     ))
-    assert '\\"tone\\":\\"direct\\"' in captured["user"]
+    assert '"tone":"direct"' in captured["user"]
 
 
 def test_scenarist_uses_legacy_prompt_when_brain_fails(monkeypatch):
@@ -688,12 +665,12 @@ def test_scenarist_uses_legacy_prompt_when_brain_fails(monkeypatch):
         "topic",
         brain=BrokenBrain(),
     ))
-    legacy_system = scenarist.GEN_SYSTEM_TMPL.format(
+    compact_system = scenarist.CONTENT_GENERATION_SYSTEM_TMPL.format(
         profile=scenarist._profile_str(profile),
-        hooks=scenarist._HOOKS_TEXT,
     )
-    assert captured["system"].startswith(legacy_system)
-    assert "CONTENT_BRIEF_JSON:" in captured["user"]
+    assert captured["system"] == compact_system
+    assert "BRIEF:" in captured["user"]
+    assert "BRAIN:" not in captured["user"]
 
 
 def test_get_or_create_is_idempotent():
@@ -945,11 +922,13 @@ def test_scenarist_logs_prompt_sizes(monkeypatch, caplog):
         ))
     message = caplog.records[-1].getMessage()
     assert "legacy_estimated_tokens=" in message
-    assert "new_estimated_tokens=" in message
-    assert "delta_percent=" in message
+    assert "optimized_estimated_tokens=" in message
+    assert "delta_vs_legacy_percent=" in message
     assert "brief_tokens=" in message
     assert "memory_tokens=" in message
     assert "brain_tokens=" in message
+    assert "creator tools" not in message
+    assert '"tone"' not in message
 
 
 def test_publishing_event_only_after_success(monkeypatch):
