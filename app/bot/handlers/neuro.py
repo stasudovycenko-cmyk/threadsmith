@@ -15,6 +15,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from sqlalchemy import text
 
+from app.core.accounts import ThreadsAccountService, ensure_aware, utc_now
 from app.core.crypto import decrypt_token
 from app.core.db import Session
 from app.core.threads_api import create_container, publish_container
@@ -41,41 +42,41 @@ def neuro_kb(active: bool, mode: str) -> InlineKeyboardMarkup:
     ])
 
 
-async def _uid(tg_id: int) -> int | None:
+async def _uid_and_account(tg_id: int):
     async with Session() as s:
-        row = (await s.execute(text(
-            "SELECT id FROM users WHERE telegram_id = :tg"
-        ), {"tg": tg_id})).first()
-    return row[0] if row else None
+        service = ThreadsAccountService(s)
+        uid = await service.user_id_for_telegram(tg_id)
+        account = await service.selected_account(uid) if uid else None
+        await s.commit()
+    return uid, account
 
 
-async def _settings(uid: int) -> tuple:
+async def _settings(uid: int, account_id: int) -> tuple:
     async with Session() as s:
-        await s.execute(text("""
-            INSERT INTO neuro_settings (user_id) VALUES (:uid)
-            ON CONFLICT (user_id) DO NOTHING
-        """), {"uid": uid})
+        await ThreadsAccountService(s).ensure_settings(uid, account_id)
         row = (await s.execute(text("""
             SELECT active, mode, daily_cap FROM neuro_settings
             WHERE user_id = :uid
-        """), {"uid": uid})).first()
+              AND threads_account_id = :account_id
+        """), {"uid": uid, "account_id": account_id})).first()
         await s.commit()
     return row
 
 
 @router.callback_query(F.data == "nc:menu")
 async def cb_menu(cb: CallbackQuery):
-    uid = await _uid(cb.from_user.id)
+    uid, account = await _uid_and_account(cb.from_user.id)
     async with Session() as s:
         ready = (await s.execute(text("""
             SELECT
               exists(SELECT 1 FROM voice_profiles WHERE user_id = :uid),
               exists(SELECT 1 FROM user_niches WHERE user_id = :uid),
-              exists(SELECT 1 FROM threads_accounts
-                     WHERE user_id = :uid AND expires_at > now()),
               coalesce((SELECT plan FROM subscriptions WHERE user_id = :uid), 'free')
         """), {"uid": uid})).first()
-    has_voice, has_niche, has_acc, plan = ready
+    has_voice, has_niche, plan = ready
+    has_acc = bool(
+        account and ensure_aware(account.expires_at) > utc_now()
+    )
 
     if plan == 'free':
         await cb.message.answer(
@@ -97,8 +98,9 @@ async def cb_menu(cb: CallbackQuery):
         await cb.answer()
         return
 
-    active, mode, cap = await _settings(uid)
+    active, mode, cap = await _settings(uid, account.id)
     await cb.message.answer(
+        f"Аккаунт: @{account.username or account.id}\n"
         f"Нейрокомментинг {'работает 🟢' if active else 'выключен ⚪'}\n"
         f"Кэп: {cap} комментов/день\n\n"
         "Бот находит свежие залётные посты ниши, пишет ценностный коммент "
@@ -113,13 +115,20 @@ async def cb_menu(cb: CallbackQuery):
 
 @router.callback_query(F.data == "nc:toggle")
 async def cb_toggle(cb: CallbackQuery):
-    uid = await _uid(cb.from_user.id)
+    uid, account = await _uid_and_account(cb.from_user.id)
+    if account is None:
+        await cb.answer("Threads-аккаунт не подключён", show_alert=True)
+        return
     async with Session() as s:
         row = (await s.execute(text("""
             UPDATE neuro_settings SET active = NOT active
-            WHERE user_id = :uid RETURNING active, mode
-        """), {"uid": uid})).first()
+            WHERE user_id = :uid AND threads_account_id = :account_id
+            RETURNING active, mode
+        """), {"uid": uid, "account_id": account.id})).first()
         await s.commit()
+    if row is None:
+        await cb.answer("Настройки аккаунта не найдены", show_alert=True)
+        return
     active, mode = row
     await cb.message.edit_reply_markup(reply_markup=neuro_kb(active, mode))
     await cb.answer("Погнали" if active else "Стоп")
@@ -127,14 +136,21 @@ async def cb_toggle(cb: CallbackQuery):
 
 @router.callback_query(F.data == "nc:mode")
 async def cb_mode(cb: CallbackQuery):
-    uid = await _uid(cb.from_user.id)
+    uid, account = await _uid_and_account(cb.from_user.id)
+    if account is None:
+        await cb.answer("Threads-аккаунт не подключён", show_alert=True)
+        return
     async with Session() as s:
         row = (await s.execute(text("""
             UPDATE neuro_settings
             SET mode = CASE WHEN mode = 'approve' THEN 'auto' ELSE 'approve' END
-            WHERE user_id = :uid RETURNING active, mode
-        """), {"uid": uid})).first()
+            WHERE user_id = :uid AND threads_account_id = :account_id
+            RETURNING active, mode
+        """), {"uid": uid, "account_id": account.id})).first()
         await s.commit()
+    if row is None:
+        await cb.answer("Настройки аккаунта не найдены", show_alert=True)
+        return
     active, mode = row
     await cb.message.edit_reply_markup(reply_markup=neuro_kb(active, mode))
     if mode == "auto":
@@ -147,7 +163,12 @@ async def cb_mode(cb: CallbackQuery):
 
 @router.callback_query(F.data == "nc:cap")
 async def cb_cap(cb: CallbackQuery, state: FSMContext):
+    _, account = await _uid_and_account(cb.from_user.id)
+    if account is None:
+        await cb.answer("Threads-аккаунт не подключён", show_alert=True)
+        return
     await state.set_state(Cap.value)
+    await state.update_data(account_id=account.id)
     await cb.message.answer("Сколько комментов в день? (1-30, рекомендую 10)")
     await cb.answer()
 
@@ -159,19 +180,28 @@ async def cap_value(msg: Message, state: FSMContext):
     except ValueError:
         await msg.answer("Числом, 1-30")
         return
+    data = await state.get_data()
     await state.clear()
-    uid = await _uid(msg.from_user.id)
+    uid, _ = await _uid_and_account(msg.from_user.id)
     async with Session() as s:
         await s.execute(text("""
-            UPDATE neuro_settings SET daily_cap = :c WHERE user_id = :uid
-        """), {"c": cap, "uid": uid})
+            UPDATE neuro_settings SET daily_cap = :c
+            WHERE user_id = :uid AND threads_account_id = :account_id
+        """), {
+            "c": cap,
+            "uid": uid,
+            "account_id": data.get("account_id"),
+        })
         await s.commit()
     await msg.answer(f"Кэп: {cap}/день")
 
 
 @router.callback_query(F.data == "nc:stats")
 async def cb_stats(cb: CallbackQuery):
-    uid = await _uid(cb.from_user.id)
+    uid, account = await _uid_and_account(cb.from_user.id)
+    if account is None:
+        await cb.answer("Threads-аккаунт не подключён", show_alert=True)
+        return
     async with Session() as s:
         row = (await s.execute(text("""
             SELECT
@@ -179,8 +209,9 @@ async def cb_stats(cb: CallbackQuery):
               count(*) FILTER (WHERE status = 'posted'
                                AND created_at::date = current_date),
               count(*) FILTER (WHERE status = 'rejected')
-            FROM neuro_comments WHERE user_id = :uid
-        """), {"uid": uid})).first()
+            FROM neuro_comments
+            WHERE user_id = :uid AND threads_account_id = :account_id
+        """), {"uid": uid, "account_id": account.id})).first()
     total, today, rejected = row
     await cb.message.answer(
         f"Комментов всего: {total}\nСегодня: {today}\nОтклонено тобой: {rejected}"
@@ -193,14 +224,18 @@ async def cb_stats(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("nc:ok:"))
 async def cb_approve(cb: CallbackQuery):
     nc_id = int(cb.data.rsplit(":", 1)[1])
-    uid = await _uid(cb.from_user.id)
+    uid, _ = await _uid_and_account(cb.from_user.id)
     async with Session() as s:
         row = (await s.execute(text("""
             SELECT nc.target_post_id, nc.comment_text,
                    ta.threads_user_id, ta.access_token_enc
             FROM neuro_comments nc
-            JOIN threads_accounts ta ON ta.user_id = nc.user_id
-                 AND ta.expires_at > now()
+            JOIN threads_accounts ta
+              ON ta.id = nc.threads_account_id
+             AND ta.user_id = nc.user_id
+             AND ta.expires_at > now()
+             AND ta.connection_status = 'connected'
+             AND ta.access_token_enc IS NOT NULL
             WHERE nc.id = :id AND nc.user_id = :uid AND nc.status = 'pending'
         """), {"id": nc_id, "uid": uid})).first()
     if not row:
@@ -234,7 +269,7 @@ async def cb_approve(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("nc:no:"))
 async def cb_reject(cb: CallbackQuery):
     nc_id = int(cb.data.rsplit(":", 1)[1])
-    uid = await _uid(cb.from_user.id)
+    uid, _ = await _uid_and_account(cb.from_user.id)
     async with Session() as s:
         await s.execute(text("""
             UPDATE neuro_comments SET status='rejected'

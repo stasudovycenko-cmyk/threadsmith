@@ -86,7 +86,11 @@ async def _poll_post(post_id: str, acc_id: int):
     async with Session() as s:
         acc = (await s.execute(text("""
             SELECT ta.threads_user_id, ta.access_token_enc, ta.user_id
-            FROM threads_accounts ta WHERE ta.id = :acc
+            FROM threads_accounts ta
+            WHERE ta.id = :acc
+              AND ta.connection_status = 'connected'
+              AND ta.access_token_enc IS NOT NULL
+              AND ta.expires_at > now()
         """), {"acc": acc_id})).first()
         if not acc:
             return

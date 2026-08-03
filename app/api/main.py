@@ -13,14 +13,27 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+)
 from sqlalchemy import text
 
+from app.core.accounts import (
+    AccountBusyError,
+    AccountNotFoundError,
+    ThreadsAccountService,
+    safe_threads_id,
+)
 from app.core.config import PLANS, settings
 from app.core.credits import topup
 from app.core.crypto import encrypt_token
 from app.core.db import Session
+from app.core.meta_callbacks import InvalidSignedRequest, verify_signed_request
 from app.core.robokassa import verify_result
 from app.core.threads_api import auth_link, exchange_code, get_me, to_long_lived
 
@@ -48,49 +61,163 @@ async def threads_callback(request: Request):
             status_code=400,
         )
 
-    async with Session() as s:
-        row = (await s.execute(text("""
-            DELETE FROM oauth_states
-            WHERE state = :st AND created_at > now() - interval '30 minutes'
-            RETURNING user_id
-        """), {"st": state})).first()
-        if not row:
-            return HTMLResponse("<h3>Ссылка протухла. Вернись в бот, нажми «Подключить» заново.</h3>")
-        user_id = row[0]
+    async with Session() as session:
+        oauth_state = (
+            await session.execute(
+                text("""
+                    DELETE FROM oauth_states
+                    WHERE state = :state
+                      AND created_at > now() - interval '30 minutes'
+                    RETURNING user_id, action,
+                              expected_threads_account_id
+                """),
+                {"state": state},
+            )
+        ).mappings().first()
+        if not oauth_state:
+            return HTMLResponse(
+                "<h3>Ссылка протухла. Вернись в бот и начни подключение заново.</h3>",
+                status_code=400,
+            )
+        await session.commit()
 
+    try:
+        short = await exchange_code(code)
+        long_token = await to_long_lived(short["access_token"])
+        me = await get_me(long_token["access_token"])
+    except Exception as error:
+        log.warning(
+            "threads oauth exchange failed error_type=%s",
+            type(error).__name__,
+        )
+        return HTMLResponse(
+            "<h3>Threads не отдал токен. Запусти подключение заново из бота.</h3>",
+            status_code=502,
+        )
+
+    user_id = int(oauth_state["user_id"])
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=int(long_token["expires_in"])
+    )
+    async with Session() as session:
+        service = ThreadsAccountService(session)
         try:
-            short = await exchange_code(code)
-            long = await to_long_lived(short["access_token"])
-            me = await get_me(long["access_token"])
-        except Exception:
-            log.exception("threads oauth failed")
-            return HTMLResponse("<h3>Threads не отдал токен. Попробуй заново из бота.</h3>")
+            outcome = await service.apply_oauth_connection(
+                user_id,
+                action=oauth_state["action"],
+                expected_account_id=oauth_state[
+                    "expected_threads_account_id"
+                ],
+                threads_user_id=str(me["id"]),
+                username=me.get("username"),
+                access_token_enc=encrypt_token(long_token["access_token"]),
+                expires_at=expires_at,
+            )
+        except AccountNotFoundError:
+            await session.rollback()
+            return HTMLResponse(
+                "<h3>Аккаунт для переподключения не найден. Вернись в бот.</h3>",
+                status_code=400,
+            )
+        telegram = (
+            await session.execute(
+                text("SELECT telegram_id FROM users WHERE id = :user_id"),
+                {"user_id": user_id},
+            )
+        ).first()
+        await session.commit()
 
-        expires = datetime.now(timezone.utc) + timedelta(seconds=long["expires_in"])
-        await s.execute(text("""
-            INSERT INTO threads_accounts
-                (user_id, threads_user_id, username, access_token_enc, expires_at)
-            VALUES (:uid, :tid, :un, :tok, :exp)
-            ON CONFLICT (threads_user_id) DO UPDATE SET
-                user_id = :uid, username = :un,
-                access_token_enc = :tok, expires_at = :exp
-        """), {
-            "uid": user_id, "tid": me["id"], "un": me.get("username"),
-            "tok": encrypt_token(long["access_token"]), "exp": expires,
-        })
-        tg = (await s.execute(text(
-            "SELECT telegram_id FROM users WHERE id = :uid"
-        ), {"uid": user_id})).first()
-        await s.commit()
+    username = outcome.username or me.get("username") or "Threads"
+    keyboard = None
+    if outcome.status == "connected_new":
+        message = (
+            f"✅ Threads подключён\n\nАккаунт: @{username}\n\n"
+            "Сделать его активным?"
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="✅ Сделать активным",
+                callback_data=f"cab:select:{outcome.account_id}",
+            )],
+            [InlineKeyboardButton(
+                text="Оставить текущий",
+                callback_data="cab:accounts",
+            )],
+            [InlineKeyboardButton(
+                text="🆕 Настроить с нуля",
+                callback_data=f"cab:setup_default:{outcome.account_id}",
+            )],
+            [InlineKeyboardButton(
+                text="📋 Скопировать настройки",
+                callback_data=f"cab:copy_settings:{outcome.account_id}",
+            )],
+        ])
+    elif outcome.status == "refreshed":
+        message = (
+            "✅ Этот аккаунт уже подключён. Авторизация обновлена.\n\n"
+            f"Аккаунт: @{username}"
+        )
+    elif outcome.status == "reconnect_mismatch":
+        log.warning(
+            "threads oauth reconnect mismatch user=%s expected_account=%s "
+            "returned_threads=%s",
+            user_id,
+            oauth_state["expected_threads_account_id"],
+            safe_threads_id(str(me["id"])),
+        )
+        expected = outcome.expected_username or "ожидаемый аккаунт"
+        returned = outcome.returned_username or "другой аккаунт"
+        message = (
+            "⚠️ Авторизован другой Threads-аккаунт.\n\n"
+            f"Ожидался: @{expected}\nПолучен: @{returned}"
+        )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="➕ Подключить как новый",
+                callback_data="cab:connect",
+            )],
+            [InlineKeyboardButton(
+                text="Отмена",
+                callback_data="cab:accounts",
+            )],
+        ])
+    else:
+        log.warning(
+            "threads oauth ownership conflict user=%s threads=%s",
+            user_id,
+            safe_threads_id(str(me["id"])),
+        )
+        message = (
+            "❌ Этот Threads-аккаунт уже связан с другим пользователем. "
+            "Автоматический перенос запрещён."
+        )
 
-    if tg:
+    if telegram:
         try:
             await bot.send_message(
-                tg[0], f"✅ Threads подключён: @{me.get('username')}"
+                telegram[0],
+                message,
+                reply_markup=keyboard,
             )
-        except Exception:
-            pass
-    return HTMLResponse("<h3>Готово. Аккаунт подключён - возвращайся в бот.</h3>")
+        except Exception as error:
+            log.warning(
+                "oauth Telegram notification failed user=%s error_type=%s",
+                user_id,
+                type(error).__name__,
+            )
+    if outcome.status == "ownership_conflict":
+        return HTMLResponse(
+            "<h3>Этот Threads-аккаунт уже подключён другим пользователем.</h3>",
+            status_code=409,
+        )
+    if outcome.status == "reconnect_mismatch":
+        return HTMLResponse(
+            "<h3>Авторизован другой аккаунт. Вернись в бот и выбери действие.</h3>",
+            status_code=409,
+        )
+    return HTMLResponse(
+        "<h3>Готово. Авторизация обновлена, возвращайся в бот.</h3>"
+    )
 
 
 @app.post("/webhooks/robokassa")
@@ -148,13 +275,7 @@ async def robokassa_result(request: Request):
 # Meta Threads: callbacks for deauthorization and data deletion
 # ============================================================
 
-import secrets as _threads_secrets
-
-from fastapi import Request as _ThreadsRequest
-from fastapi.responses import JSONResponse as _ThreadsJSONResponse
-
-
-async def _read_threads_meta_payload(request: _ThreadsRequest) -> dict:
+async def _read_threads_meta_payload(request: Request) -> dict:
     """Read JSON or form-urlencoded payload sent by Meta."""
     try:
         content_type = request.headers.get("content-type", "")
@@ -174,7 +295,7 @@ async def _read_threads_meta_payload(request: _ThreadsRequest) -> dict:
     "/oauth/threads/deauthorize",
     methods=["GET", "POST"],
 )
-async def threads_deauthorize_callback(request: _ThreadsRequest):
+async def threads_deauthorize_callback(request: Request):
     if request.method == "GET":
         return {
             "status": "ok",
@@ -182,55 +303,121 @@ async def threads_deauthorize_callback(request: _ThreadsRequest):
         }
 
     payload = await _read_threads_meta_payload(request)
-    signed_request = payload.get("signed_request")
-
-    # TODO:
-    # После подключения полноценного удаления здесь нужно:
-    # 1. Проверить signed_request с помощью секрета приложения Meta.
-    # 2. Найти пользователя в базе.
-    # 3. Удалить его Threads access token.
-    # 4. Остановить его автоматизации.
-
-    return _ThreadsJSONResponse(
-        status_code=200,
-        content={
-            "success": True,
-            "signed_request_received": bool(signed_request),
-        },
-    )
+    try:
+        verified = verify_signed_request(
+            payload.get("signed_request", ""),
+            settings.THREADS_APP_SECRET,
+        )
+    except InvalidSignedRequest:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": "invalid_signed_request"},
+        )
+    threads_user_id = str(verified["user_id"])
+    async with Session() as session:
+        row = (
+            await session.execute(
+                text("""
+                    SELECT id, user_id
+                    FROM threads_accounts
+                    WHERE threads_user_id = :threads_user_id
+                    FOR UPDATE
+                """),
+                {"threads_user_id": threads_user_id},
+            )
+        ).first()
+        if row:
+            try:
+                await ThreadsAccountService(session).disconnect(
+                    int(row[1]),
+                    int(row[0]),
+                )
+            except AccountNotFoundError:
+                pass
+        await session.commit()
+    return JSONResponse(status_code=200, content={"success": True})
 
 
 @app.api_route(
     "/oauth/threads/data-deletion",
     methods=["GET", "POST"],
 )
-async def threads_data_deletion_callback(request: _ThreadsRequest):
+async def threads_data_deletion_callback(request: Request):
     if request.method == "GET":
         confirmation_code = request.query_params.get("code")
 
+        if not confirmation_code:
+            return {"status": "ready"}
+        async with Session() as session:
+            row = (
+                await session.execute(
+                    text("""
+                        SELECT status, requested_at, completed_at
+                        FROM threads_data_deletion_requests
+                        WHERE confirmation_code = :confirmation_code
+                    """),
+                    {"confirmation_code": confirmation_code},
+                )
+            ).mappings().first()
+        if row is None:
+            return JSONResponse(
+                status_code=404,
+                content={"status": "not_found"},
+            )
         return {
-            "status": "completed" if confirmation_code else "ready",
+            "status": row["status"],
             "confirmation_code": confirmation_code,
         }
 
     payload = await _read_threads_meta_payload(request)
-    signed_request = payload.get("signed_request")
+    try:
+        verified = verify_signed_request(
+            payload.get("signed_request", ""),
+            settings.THREADS_APP_SECRET,
+        )
+    except InvalidSignedRequest:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_signed_request"},
+        )
+    threads_user_id = str(verified["user_id"])
+    async with Session() as session:
+        service = ThreadsAccountService(session)
+        row = (
+            await session.execute(
+                text("""
+                    SELECT id, user_id
+                    FROM threads_accounts
+                    WHERE threads_user_id = :threads_user_id
+                    FOR UPDATE
+                """),
+                {"threads_user_id": threads_user_id},
+            )
+        ).first()
+        if row:
+            try:
+                await service.delete_account_data(int(row[1]), int(row[0]))
+            except AccountBusyError:
+                await session.rollback()
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "publication_in_progress"},
+                )
+        confirmation_code = await service.record_deletion_request(
+            threads_user_id,
+            status="completed",
+        )
+        await session.commit()
 
-    confirmation_code = _threads_secrets.token_urlsafe(18)
-
-    # TODO:
-    # Здесь нужно будет выполнить настоящее удаление пользователя,
-    # его Threads-токенов, настроек и связанных данных из базы.
-
-    return _ThreadsJSONResponse(
+    base_url = settings.PUBLIC_BASE_URL.rstrip("/") or "https://threadsmith.pro"
+    return JSONResponse(
         status_code=200,
         content={
             "url": (
-                "https://threadsmith.pro/oauth/threads/"
+                f"{base_url}/oauth/threads/"
                 f"data-deletion?code={confirmation_code}"
             ),
             "confirmation_code": confirmation_code,
-            "signed_request_received": bool(signed_request),
         },
     )
 
@@ -314,7 +501,7 @@ async def threads_oauth_start(request: Request):
         )
 
     url = auth_link(state)
-    log.info("threads oauth start state=%s redirect=%s", state, url)
+    log.info("threads oauth start accepted")
 
     return RedirectResponse(url=url, status_code=302)
 

@@ -17,6 +17,10 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 from sqlalchemy import text
 
 from app.core import credits, radar
+from app.core.accounts import (
+    ThreadsAccountService,
+    authorization_status,
+)
 from app.core.ai_cost import AIUsageContext
 from app.core.config import CREDIT_COSTS
 from app.core.crypto import decrypt_token
@@ -42,13 +46,19 @@ def radar_kb() -> InlineKeyboardMarkup:
 
 async def _uid_acc(tg_id: int):
     async with Session() as s:
-        row = (await s.execute(text("""
-            SELECT u.id, ta.id, ta.access_token_enc FROM users u
-            LEFT JOIN threads_accounts ta ON ta.user_id = u.id
-            WHERE u.telegram_id = :tg
-            ORDER BY ta.created_at DESC LIMIT 1
-        """), {"tg": tg_id})).first()
-    return row if row else (None, None, None)
+        service = ThreadsAccountService(s)
+        user_id = await service.user_id_for_telegram(tg_id)
+        account = (
+            await service.selected_credentials(user_id)
+            if user_id is not None
+            else None
+        )
+        await s.commit()
+    if account is None:
+        return user_id, None, None
+    if authorization_status(account) == "EXPIRED":
+        return user_id, account.id, None
+    return user_id, account.id, account.access_token_enc
 
 
 @router.callback_query(F.data == "rd:menu")
@@ -105,6 +115,13 @@ async def cb_top(cb: CallbackQuery):
     uid, acc_id, tok_enc = await _uid_acc(cb.from_user.id)
     if not acc_id:
         await cb.message.answer("Подключи Threads: /start -> Подключить Threads")
+        await cb.answer()
+        return
+    if tok_enc is None:
+        await cb.message.answer(
+            "Авторизация Threads истекла. Переподключи аккаунт в личном "
+            "кабинете."
+        )
         await cb.answer()
         return
 
@@ -221,7 +238,11 @@ async def cb_razbor(cb: CallbackQuery):
 
 @router.callback_query(F.data == "rd:my")
 async def cb_my(cb: CallbackQuery):
-    uid, _, _ = await _uid_acc(cb.from_user.id)
+    uid, account_id, _ = await _uid_acc(cb.from_user.id)
+    if account_id is None:
+        await cb.message.answer("Threads-аккаунт не подключён.")
+        await cb.answer()
+        return
     async with Session() as s:
         rows = (await s.execute(text("""
             SELECT sp.text, isnap.metrics_json
@@ -231,9 +252,11 @@ async def cb_my(cb: CallbackQuery):
                 WHERE i.threads_post_id = sp.threads_post_id
                 ORDER BY snapshot_date DESC LIMIT 1
             ) isnap ON true
-            WHERE sp.user_id = :uid AND sp.status = 'done'
+            WHERE sp.user_id = :uid
+              AND sp.threads_account_id = :account_id
+              AND sp.status = 'done'
             ORDER BY sp.run_at DESC LIMIT 5
-        """), {"uid": uid})).all()
+        """), {"uid": uid, "account_id": account_id})).all()
 
     if not rows:
         await cb.message.answer(

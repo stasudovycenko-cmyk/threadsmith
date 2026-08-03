@@ -385,7 +385,7 @@ def test_disabling_skips_future_runs_but_not_publishing():
         [],
     ])
     skipped = asyncio.run(
-        AutopostStatusService(session).skip_pending_for_user(7)
+        AutopostStatusService(session).skip_pending_for_account(7, 11)
     )
     assert skipped == 2
     sql = session.calls[0][0]
@@ -393,6 +393,7 @@ def test_disabling_skips_future_runs_but_not_publishing():
     assert "status = 'skipped'" in sql
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert session.calls[1][1]["post_ids"] == [901]
+    assert session.calls[0][1]["account_id"] == 11
 
 
 def test_publication_claim_is_atomic_and_timestamped():

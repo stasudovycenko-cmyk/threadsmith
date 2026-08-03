@@ -20,6 +20,7 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🤖 Нейрокомментинг", callback_data="nc:menu")],
         [InlineKeyboardButton(text="📡 Радар", callback_data="rd:menu"),
          InlineKeyboardButton(text="🔗 Подключить Threads", callback_data="connect")],
+        [InlineKeyboardButton(text="👤 Личный кабинет", callback_data="cab:menu")],
         [InlineKeyboardButton(text="💳 Тарифы", callback_data="plans"),
          InlineKeyboardButton(text="⚡ Баланс", callback_data="balance")],
         [InlineKeyboardButton(text="📄 Документы", callback_data="docs:menu")],

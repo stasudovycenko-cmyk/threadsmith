@@ -21,6 +21,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
 from sqlalchemy import text
 
 from app.core import credits, scenarist, social_brain
+from app.core.accounts import ThreadsAccountService
 from app.core.ai_cost import AIUsageContext
 from app.core.content_engine import ContentMemoryRepo
 from app.core.config import CREDIT_COSTS
@@ -81,14 +82,9 @@ async def _require_voice(cb: CallbackQuery, uid: int) -> dict | None:
 
 async def _single_account_id(uid: int) -> int | None:
     async with Session() as s:
-        rows = (await s.execute(text("""
-            SELECT id
-            FROM threads_accounts
-            WHERE user_id = :uid
-            ORDER BY id
-            LIMIT 2
-        """), {"uid": uid})).all()
-    return rows[0][0] if len(rows) == 1 else None
+        account = await ThreadsAccountService(s).selected_account(uid)
+        await s.commit()
+    return account.id if account else None
 
 
 async def _load_brain(uid: int, threads_account_id: int):

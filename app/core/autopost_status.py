@@ -59,7 +59,9 @@ _ACCOUNT_SETTINGS_SQL = text("""
       coalesce(ac.days, 'all') AS days,
       coalesce(ac.timezone, :default_timezone) AS timezone
     FROM threads_accounts ta
-    LEFT JOIN autocontent_settings ac ON ac.user_id = ta.user_id
+    LEFT JOIN autocontent_settings ac
+      ON ac.threads_account_id = ta.id
+     AND ac.user_id = ta.user_id
     WHERE ta.id = :account_id
       AND ta.user_id = :uid
 """)
@@ -68,6 +70,8 @@ _LIST_ACCOUNTS_SQL = text("""
     SELECT id, username, expires_at
     FROM threads_accounts
     WHERE user_id = :uid
+      AND connection_status = 'connected'
+      AND access_token_enc IS NOT NULL
     ORDER BY created_at DESC, id DESC
 """)
 
@@ -700,6 +704,7 @@ class AutopostStatusService:
                     WHERE EXISTS (
                         SELECT 1 FROM autocontent_settings
                         WHERE user_id = :uid
+                          AND threads_account_id = :account_id
                           AND active
                     )
                     ON CONFLICT DO NOTHING
@@ -1092,8 +1097,9 @@ class AutopostStatusService:
                     UPDATE autocontent_settings
                     SET active = false
                     WHERE user_id = :uid
+                      AND threads_account_id = :account_id
                 """),
-                {"uid": user_id},
+                {"uid": user_id, "account_id": account_id},
             )
         return AutopostQueueClearResult(
             deleted_posts=len(deleted),
@@ -1170,7 +1176,11 @@ class AutopostStatusService:
             },
         )
 
-    async def skip_pending_for_user(self, user_id: int) -> int:
+    async def skip_pending_for_account(
+        self,
+        user_id: int,
+        account_id: int,
+    ) -> int:
         rows = (
             await self.session.execute(
                 text("""
@@ -1178,6 +1188,7 @@ class AutopostStatusService:
                       SELECT post.id
                       FROM scheduled_posts post
                       WHERE post.user_id = :uid
+                        AND post.threads_account_id = :account_id
                         AND post.status = 'pending'
                         AND (
                           post.content_metadata ->> 'source' = 'autocontent'
@@ -1195,6 +1206,7 @@ class AutopostStatusService:
                         error_code = NULL,
                         safe_error_message = :message
                     WHERE run.user_id = :uid
+                      AND run.threads_account_id = :account_id
                       AND run.status = 'pending'
                       AND (
                         run.scheduled_post_id IS NULL
@@ -1206,6 +1218,7 @@ class AutopostStatusService:
                 """),
                 {
                     "uid": user_id,
+                    "account_id": account_id,
                     "message": "Пропущено: автопостинг выключен",
                 },
             )
@@ -1217,13 +1230,18 @@ class AutopostStatusService:
                 SET status = 'failed',
                     error = 'Autopost disabled'
                 WHERE user_id = :uid
+                  AND threads_account_id = :account_id
                   AND status = 'pending'
                   AND (
                     id = ANY(CAST(:post_ids AS bigint[]))
                     OR content_metadata ->> 'source' = 'autocontent'
                   )
             """),
-            {"uid": user_id, "post_ids": post_ids},
+            {
+                "uid": user_id,
+                "account_id": account_id,
+                "post_ids": post_ids,
+            },
         )
         return len(rows)
 

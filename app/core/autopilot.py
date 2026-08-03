@@ -44,9 +44,15 @@ async def claim_due_posts(session: AsyncSession, limit: int = 10) -> list:
         UPDATE scheduled_posts
         SET status = 'publishing', publish_started_at = now()
         WHERE id IN (
-            SELECT id FROM scheduled_posts
-            WHERE status = 'pending' AND run_at <= now()
-            ORDER BY run_at LIMIT :lim
+            SELECT post.id
+            FROM scheduled_posts post
+            JOIN threads_accounts account
+              ON account.id = post.threads_account_id
+             AND account.user_id = post.user_id
+             AND account.connection_status = 'connected'
+             AND account.access_token_enc IS NOT NULL
+            WHERE post.status = 'pending' AND post.run_at <= now()
+            ORDER BY post.run_at LIMIT :lim
             FOR UPDATE SKIP LOCKED
         )
         RETURNING id, user_id, threads_account_id, text, media_url, link
@@ -95,7 +101,10 @@ async def publish_one(session: AsyncSession, post_row) -> tuple[bool, str]:
         SELECT threads_user_id, access_token_enc, expires_at
         FROM threads_accounts
         WHERE id = :acc
-    """), {"acc": acc_id})).first()
+          AND user_id = :uid
+          AND connection_status = 'connected'
+          AND access_token_enc IS NOT NULL
+    """), {"acc": acc_id, "uid": user_id})).first()
     if not acc:
         code = "AUTH_EXPIRED"
         message = SAFE_ERROR_MESSAGES[code]

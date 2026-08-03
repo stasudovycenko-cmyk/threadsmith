@@ -72,9 +72,12 @@ async def insights_snapshotter():
                 ta.access_token_enc
             FROM scheduled_posts sp
             JOIN threads_accounts ta ON ta.id = sp.threads_account_id
+                                    AND ta.user_id = sp.user_id
             WHERE sp.status = 'done' AND sp.threads_post_id IS NOT NULL
               AND sp.run_at > now() - interval '30 days'
               AND ta.expires_at > now()
+              AND ta.connection_status = 'connected'
+              AND ta.access_token_enc IS NOT NULL
         """))).all()
 
     for post_id, user_id, account_id, tok_enc in rows:

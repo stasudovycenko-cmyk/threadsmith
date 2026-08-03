@@ -8,6 +8,7 @@ from app.bot.handlers.nav import router as nav_router
 from app.bot.handlers.docs import router as docs_router
 from app.bot.handlers.autocontent_ui import router as autocontent_router
 from app.bot.handlers.autopilot import router as autopilot_router
+from app.bot.handlers.cabinet import router as cabinet_router
 from app.bot.handlers.neuro import router as neuro_router
 from app.bot.handlers.radar import router as radar_router
 from app.bot.handlers.scenarist import router as scenarist_router
@@ -30,6 +31,7 @@ async def main():
     dp.include_router(docs_router)
 
     dp.include_router(start_router)
+    dp.include_router(cabinet_router)
     dp.include_router(scenarist_router)
     dp.include_router(autopilot_router)
     dp.include_router(autocontent_router)

@@ -60,14 +60,26 @@ def test_neuro_llm_calls_are_capped_per_run(monkeypatch):
         for index in range(20)
     ]
 
-    async def today_count(_session, _uid):
+    async def today_count(_session, _uid, _account_id):
         return 0
 
-    async def pick_candidates(_session, _uid, _niche, *, limit):
+    async def pick_candidates(
+        _session,
+        _uid,
+        _account_id,
+        _niche,
+        *,
+        limit,
+    ):
         assert limit == m4_jobs.NEURO_MAX_CANDIDATES_PER_RUN
         return candidates
 
-    async def author_commented_today(_session, _uid, _author):
+    async def author_commented_today(
+        _session,
+        _uid,
+        _account_id,
+        _author,
+    ):
         return False
 
     async def generate_comment(*_args, **_kwargs):

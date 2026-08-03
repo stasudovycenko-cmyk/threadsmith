@@ -78,28 +78,47 @@ async def generate_comment(
     return result
 
 
-async def today_count(session: AsyncSession, user_id: int) -> int:
+async def today_count(
+    session: AsyncSession,
+    user_id: int,
+    account_id: int,
+) -> int:
     row = (await session.execute(text("""
         SELECT count(*) FROM neuro_comments
         WHERE user_id = :uid AND created_at::date = current_date
+          AND threads_account_id = :account_id
           AND status IN ('pending', 'posted')
-    """), {"uid": user_id})).first()
+    """), {"uid": user_id, "account_id": account_id})).first()
     return row[0]
 
 
-async def author_commented_today(session: AsyncSession, user_id: int,
-                                 author: str) -> bool:
+async def author_commented_today(
+    session: AsyncSession,
+    user_id: int,
+    account_id: int,
+    author: str,
+) -> bool:
     row = (await session.execute(text("""
         SELECT 1 FROM neuro_comments
         WHERE user_id = :uid AND target_author = :a
+          AND threads_account_id = :account_id
           AND created_at::date = current_date
         LIMIT 1
-    """), {"uid": user_id, "a": author})).first()
+    """), {
+        "uid": user_id,
+        "account_id": account_id,
+        "a": author,
+    })).first()
     return row is not None
 
 
-async def pick_candidates(session: AsyncSession, user_id: int, niche: str,
-                          limit: int = 5) -> list:
+async def pick_candidates(
+    session: AsyncSession,
+    user_id: int,
+    account_id: int,
+    niche: str,
+    limit: int = 5,
+) -> list:
     """Свежие посты ниши из библиотеки, которые юзер ещё не комментил.
     Свои посты юзера отсекаем по username его threads-аккаунта."""
     return (await session.execute(text("""
@@ -114,8 +133,14 @@ async def pick_candidates(session: AsyncSession, user_id: int, niche: str,
           AND NOT EXISTS (
               SELECT 1 FROM neuro_comments nc
               WHERE nc.user_id = :uid
+                AND nc.threads_account_id = :account_id
                 AND nc.target_post_id = pl.threads_post_id
           )
         ORDER BY pl.virality_score DESC
         LIMIT :lim
-    """), {"niche": niche, "uid": user_id, "lim": limit})).all()
+    """), {
+        "niche": niche,
+        "uid": user_id,
+        "account_id": account_id,
+        "lim": limit,
+    })).all()

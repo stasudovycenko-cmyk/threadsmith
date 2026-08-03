@@ -564,24 +564,29 @@ def test_scenarist_falls_back_when_selected_account_is_invalid(
     ) is None
 
 
-def test_scenarist_infers_only_unambiguous_single_account(
+def test_scenarist_uses_selected_account(
     monkeypatch,
 ):
-    sessions = iter([
-        FakeSession([[(101,)]]),
-        FakeSession([[(101,), (202,)]]),
-    ])
+    class SelectedAccountService:
+        def __init__(self, _session):
+            pass
+
+        async def selected_account(self, _uid):
+            return type("Account", (), {"id": 202})()
+
     monkeypatch.setattr(
         scenarist_handler,
         "Session",
-        lambda: FakeSessionContext(next(sessions)),
+        lambda: FakeSessionContext(FakeSession()),
+    )
+    monkeypatch.setattr(
+        scenarist_handler,
+        "ThreadsAccountService",
+        SelectedAccountService,
     )
     assert asyncio.run(
         scenarist_handler._single_account_id(7)
-    ) == 101
-    assert asyncio.run(
-        scenarist_handler._single_account_id(7)
-    ) is None
+    ) == 202
 
 
 def test_scenarist_uses_compact_prompt_without_brain(

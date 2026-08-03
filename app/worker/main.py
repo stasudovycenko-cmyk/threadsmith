@@ -30,6 +30,8 @@ async def token_refresher():
             SELECT id, access_token_enc, user_id FROM threads_accounts
             WHERE expires_at < now() + interval '7 days'
               AND expires_at > now()
+              AND connection_status = 'connected'
+              AND access_token_enc IS NOT NULL
         """))).all()
 
         for acc_id, tok_enc, user_id in rows:
@@ -41,11 +43,19 @@ async def token_refresher():
                     UPDATE threads_accounts
                     SET access_token_enc = :tok, expires_at = :exp
                     WHERE id = :id
+                      AND user_id = :user_id
+                      AND connection_status = 'connected'
                 """), {"tok": encrypt_token(new["access_token"]),
-                       "exp": expires, "id": acc_id})
+                       "exp": expires, "id": acc_id,
+                       "user_id": user_id})
                 log.info("refreshed token acc=%s", acc_id)
-            except Exception:
-                log.exception("refresh failed acc=%s user=%s", acc_id, user_id)
+            except Exception as error:
+                log.warning(
+                    "refresh failed acc=%s user=%s error_type=%s",
+                    acc_id,
+                    user_id,
+                    type(error).__name__,
+                )
         await s.commit()
 
 

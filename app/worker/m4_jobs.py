@@ -42,8 +42,12 @@ async def neuro_hunter():
             FROM neuro_settings ns
             JOIN user_niches un ON un.user_id = ns.user_id
             JOIN voice_profiles vp ON vp.user_id = ns.user_id
-            JOIN threads_accounts ta ON ta.user_id = ns.user_id
-                 AND ta.expires_at > now()
+            JOIN threads_accounts ta
+              ON ta.id = ns.threads_account_id
+             AND ta.user_id = ns.user_id
+             AND ta.expires_at > now()
+             AND ta.connection_status = 'connected'
+             AND ta.access_token_enc IS NOT NULL
             JOIN users u ON u.id = ns.user_id
             WHERE ns.active
         """))).all()
@@ -65,12 +69,13 @@ async def _hunt_for_user(uid, mode, cap, niche, profile,
                          threads_uid, tok_enc, tg_id, *,
                          acc_id=None):
     async with Session() as s:
-        done_today = await neuro.today_count(s, uid)
+        done_today = await neuro.today_count(s, uid, acc_id)
         if done_today >= cap:
             return
         candidates = await neuro.pick_candidates(
             s,
             uid,
+            acc_id,
             niche,
             limit=NEURO_MAX_CANDIDATES_PER_RUN,
         )
@@ -97,7 +102,12 @@ async def _hunt_for_user(uid, mode, cap, niche, profile,
             )
             break
         async with Session() as s:
-            if await neuro.author_commented_today(s, uid, author):
+            if await neuro.author_commented_today(
+                s,
+                uid,
+                acc_id,
+                author,
+            ):
                 continue
 
         llm_calls += 1
@@ -127,13 +137,19 @@ async def _hunt_for_user(uid, mode, cap, niche, profile,
             # unique(user_id, target_post_id) закрывает гонку двух прогонов
             ins = (await s.execute(text("""
                 INSERT INTO neuro_comments
-                    (user_id, target_post_id, target_author, target_text,
-                     comment_text, status)
-                VALUES (:uid, :pid, :a, :tt, :c, 'pending')
-                ON CONFLICT (user_id, target_post_id) DO NOTHING
+                    (user_id, threads_account_id, target_post_id,
+                     target_author, target_text, comment_text, status)
+                VALUES (:uid, :account_id, :pid, :a, :tt, :c, 'pending')
+                ON CONFLICT DO NOTHING
                 RETURNING id
-            """), {"uid": uid, "pid": post_id, "a": author,
-                   "tt": post_text[:500], "c": comment})).first()
+            """), {
+                "uid": uid,
+                "account_id": acc_id,
+                "pid": post_id,
+                "a": author,
+                "tt": post_text[:500],
+                "c": comment,
+            })).first()
             await s.commit()
         if not ins:
             continue

@@ -56,8 +56,12 @@ async def autocontent_planner():
             FROM autocontent_settings ac
             JOIN user_niches un ON un.user_id = ac.user_id
             JOIN voice_profiles vp ON vp.user_id = ac.user_id
-            JOIN threads_accounts ta ON ta.user_id = ac.user_id
+            JOIN threads_accounts ta
+              ON ta.id = ac.threads_account_id
+             AND ta.user_id = ac.user_id
             WHERE ac.active
+              AND ta.connection_status = 'connected'
+              AND ta.access_token_enc IS NOT NULL
         """))).all()
 
     planner_run_id = uuid.uuid4().hex
@@ -151,9 +155,11 @@ async def _plan_for_user(
         settings_row = (await s.execute(text(
             "SELECT topics, slots, days, coalesce(goal,''), "
             "coalesce(timezone, :default_timezone) "
-            "FROM autocontent_settings WHERE user_id = :uid"
+            "FROM autocontent_settings "
+            "WHERE user_id = :uid AND threads_account_id = :account_id"
         ), {
             "uid": uid,
+            "account_id": acc_id,
             "default_timezone": DEFAULT_TIMEZONE,
         })).first()
         topics_raw, slots_raw, days, goal_key, timezone_name = (

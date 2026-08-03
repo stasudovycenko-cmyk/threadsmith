@@ -15,6 +15,7 @@ from aiogram.types import (
 )
 from sqlalchemy import text
 
+from app.core.accounts import ThreadsAccountService
 from app.core.autopost_status import (
     AutopostStatusService,
     DEFAULT_TIMEZONE,
@@ -56,15 +57,11 @@ async def _uid(tg_id: int) -> int | None:
     return row[0] if row else None
 
 
-async def _ensure_settings(uid: int) -> None:
+async def _ensure_settings(uid: int, account_id: int) -> None:
     async with Session() as session:
-        await session.execute(
-            text("""
-                INSERT INTO autocontent_settings (user_id)
-                VALUES (:uid)
-                ON CONFLICT (user_id) DO NOTHING
-            """),
-            {"uid": uid},
+        await ThreadsAccountService(session).ensure_settings(
+            uid,
+            account_id,
         )
         await session.commit()
 
@@ -89,13 +86,17 @@ async def _readiness(uid: int) -> tuple[bool, bool]:
 
 
 async def _load_menu(uid: int, account_id: int | None = None):
-    await _ensure_settings(uid)
     async with Session() as session:
+        account_service = ThreadsAccountService(session)
         service = AutopostStatusService(session)
         accounts = await service.list_accounts(uid)
         if not accounts:
             return None, []
-        selected_id = account_id or accounts[0].id
+        selected = await account_service.selected_account(uid)
+        selected_id = account_id or (
+            selected.id if selected else accounts[0].id
+        )
+        await account_service.ensure_settings(uid, selected_id)
         status = await service.get_status(uid, selected_id)
         return status, accounts
 
@@ -105,6 +106,16 @@ def _account_callback_id(data: str) -> int | None:
         return int(data.rsplit(":", 1)[1])
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+async def _resolved_account_id(uid: int, data: str) -> int | None:
+    explicit = _account_callback_id(data)
+    if explicit is not None:
+        return explicit
+    async with Session() as session:
+        selected = await ThreadsAccountService(session).selected_account(uid)
+        await session.commit()
+    return selected.id if selected else None
 
 
 def _menu_kb(status, accounts) -> InlineKeyboardMarkup:
@@ -276,7 +287,10 @@ async def cb_refresh(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("ac:toggle:"))
 async def cb_toggle(cb: CallbackQuery):
     uid = await _uid(cb.from_user.id)
-    account_id = _account_callback_id(cb.data)
+    account_id = await _resolved_account_id(uid, cb.data)
+    if account_id is None:
+        await cb.answer("Threads-аккаунт не подключён", show_alert=True)
+        return
     async with Session() as session:
         row = (
             await session.execute(
@@ -284,15 +298,16 @@ async def cb_toggle(cb: CallbackQuery):
                 UPDATE autocontent_settings
                 SET active = NOT active
                 WHERE user_id = :uid
+                  AND threads_account_id = :account_id
                 RETURNING active
             """),
-                {"uid": uid},
+                {"uid": uid, "account_id": account_id},
             )
         ).first()
         if row and not row[0]:
             await AutopostStatusService(
                 session
-            ).skip_pending_for_user(uid)
+            ).skip_pending_for_account(uid, account_id)
         await session.commit()
     await _show_menu(cb, account_id=account_id, edit=True)
 
@@ -300,10 +315,13 @@ async def cb_toggle(cb: CallbackQuery):
 @router.callback_query(F.data == "ac:cap")
 @router.callback_query(F.data.startswith("ac:cap:"))
 async def cb_cap(cb: CallbackQuery, state: FSMContext):
+    uid = await _uid(cb.from_user.id)
+    account_id = await _resolved_account_id(uid, cb.data)
+    if account_id is None:
+        await cb.answer("Threads-аккаунт не подключён", show_alert=True)
+        return
     await state.set_state(AcCap.value)
-    await state.update_data(
-        account_id=_account_callback_id(cb.data),
-    )
+    await state.update_data(account_id=account_id)
     await cb.message.answer(
         "Сколько постов в день писать автоматом? (1-5)"
     )
@@ -326,8 +344,13 @@ async def cap_value(msg: Message, state: FSMContext):
                 UPDATE autocontent_settings
                 SET posts_per_day = :posts_per_day
                 WHERE user_id = :uid
+                  AND threads_account_id = :account_id
             """),
-            {"posts_per_day": posts_per_day, "uid": uid},
+            {
+                "posts_per_day": posts_per_day,
+                "uid": uid,
+                "account_id": data["account_id"],
+            },
         )
         await session.commit()
     await _answer_schedule_changed(
@@ -341,7 +364,10 @@ async def cap_value(msg: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("ac:topics:"))
 async def cb_topics(cb: CallbackQuery, state: FSMContext):
     uid = await _uid(cb.from_user.id)
-    account_id = _account_callback_id(cb.data)
+    account_id = await _resolved_account_id(uid, cb.data)
+    if account_id is None:
+        await cb.answer("Threads-аккаунт не подключён", show_alert=True)
+        return
     async with Session() as session:
         row = (
             await session.execute(
@@ -349,8 +375,9 @@ async def cb_topics(cb: CallbackQuery, state: FSMContext):
                     SELECT topics
                     FROM autocontent_settings
                     WHERE user_id = :uid
+                      AND threads_account_id = :account_id
                 """),
-                {"uid": uid},
+                {"uid": uid, "account_id": account_id},
             )
         ).first()
     current = (row[0] if row else "") or ""
@@ -379,8 +406,13 @@ async def topics_value(msg: Message, state: FSMContext):
                 UPDATE autocontent_settings
                 SET topics = :topics
                 WHERE user_id = :uid
+                  AND threads_account_id = :account_id
             """),
-            {"topics": topics, "uid": uid},
+            {
+                "topics": topics,
+                "uid": uid,
+                "account_id": data["account_id"],
+            },
         )
         await session.commit()
     await _answer_status(msg, uid, data["account_id"])
@@ -438,10 +470,13 @@ async def cb_sched(cb: CallbackQuery):
 @router.callback_query(F.data == "ac:slots")
 @router.callback_query(F.data.startswith("ac:slots:"))
 async def cb_slots(cb: CallbackQuery, state: FSMContext):
+    uid = await _uid(cb.from_user.id)
+    account_id = await _resolved_account_id(uid, cb.data)
+    if account_id is None:
+        await cb.answer("Threads-аккаунт не подключён", show_alert=True)
+        return
     await state.set_state(AcSlots.value)
-    await state.update_data(
-        account_id=_account_callback_id(cb.data),
-    )
+    await state.update_data(account_id=account_id)
     await cb.message.answer(
         "Пришли время через запятую. Пример: 09:00,14:30,19:00"
     )
@@ -467,8 +502,13 @@ async def slots_value(msg: Message, state: FSMContext):
                 UPDATE autocontent_settings
                 SET slots = :slots
                 WHERE user_id = :uid
+                  AND threads_account_id = :account_id
             """),
-            {"slots": serialized, "uid": uid},
+            {
+                "slots": serialized,
+                "uid": uid,
+                "account_id": data["account_id"],
+            },
         )
         await session.commit()
     await _answer_schedule_changed(
@@ -482,7 +522,10 @@ async def slots_value(msg: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("ac:days:"))
 async def cb_days(cb: CallbackQuery):
     uid = await _uid(cb.from_user.id)
-    account_id = _account_callback_id(cb.data)
+    account_id = await _resolved_account_id(uid, cb.data)
+    if account_id is None:
+        await cb.answer("Threads-аккаунт не подключён", show_alert=True)
+        return
     async with Session() as session:
         row = (
             await session.execute(
@@ -490,8 +533,9 @@ async def cb_days(cb: CallbackQuery):
                     SELECT days
                     FROM autocontent_settings
                     WHERE user_id = :uid
+                      AND threads_account_id = :account_id
                 """),
-                {"uid": uid},
+                {"uid": uid, "account_id": account_id},
             )
         ).first()
         current = (row[0] if row else "") or "all"
@@ -501,8 +545,13 @@ async def cb_days(cb: CallbackQuery):
                 UPDATE autocontent_settings
                 SET days = :days
                 WHERE user_id = :uid
+                  AND threads_account_id = :account_id
             """),
-            {"days": next_value, "uid": uid},
+            {
+                "days": next_value,
+                "uid": uid,
+                "account_id": account_id,
+            },
         )
         await session.commit()
     await _answer_schedule_changed(
@@ -545,8 +594,13 @@ async def timezone_value(msg: Message, state: FSMContext):
                 UPDATE autocontent_settings
                 SET timezone = :timezone
                 WHERE user_id = :uid
+                  AND threads_account_id = :account_id
             """),
-            {"timezone": timezone_name, "uid": uid},
+            {
+                "timezone": timezone_name,
+                "uid": uid,
+                "account_id": data["account_id"],
+            },
         )
         await session.commit()
     await _answer_schedule_changed(
@@ -582,8 +636,9 @@ async def cb_goal(cb: CallbackQuery):
                     SELECT coalesce(goal, '')
                     FROM autocontent_settings
                     WHERE user_id = :uid
+                      AND threads_account_id = :account_id
                 """),
-                {"uid": uid},
+                {"uid": uid, "account_id": account_id},
             )
         ).first()
     current = row[0] if row else ""
@@ -619,17 +674,26 @@ async def cb_setgoal(cb: CallbackQuery):
         )
         goal = GOAL_CYCLE[index]
     else:
-        account_id = None
+        uid = await _uid(cb.from_user.id)
+        account_id = await _resolved_account_id(uid, cb.data)
         goal = parts[2] if len(parts) == 3 else ""
     uid = await _uid(cb.from_user.id)
+    if account_id is None:
+        await cb.answer("Threads-аккаунт не подключён", show_alert=True)
+        return
     async with Session() as session:
         await session.execute(
             text("""
                 UPDATE autocontent_settings
                 SET goal = :goal
                 WHERE user_id = :uid
+                  AND threads_account_id = :account_id
             """),
-            {"goal": goal, "uid": uid},
+            {
+                "goal": goal,
+                "uid": uid,
+                "account_id": account_id,
+            },
         )
         await session.commit()
     await _show_menu(cb, account_id=account_id, edit=False)

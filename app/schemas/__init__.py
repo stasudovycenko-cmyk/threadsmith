@@ -1,5 +1,16 @@
 """Typed schemas used at application boundaries."""
 
+from app.schemas.accounts import (
+    AccountMutationResult,
+    AuthorizationStatus,
+    ConnectionStatus,
+    OAuthConnectionResult,
+    OAuthConnectionStatus,
+    OAuthState,
+    SelectedThreadsAccount,
+    ThreadsAccount,
+)
+
 from app.schemas.autopost import (
     AutopostAccount,
     AutopostErrorCode,
@@ -51,6 +62,14 @@ from app.schemas.social_brain import (
 )
 
 __all__ = [
+    "AccountMutationResult",
+    "AuthorizationStatus",
+    "ConnectionStatus",
+    "OAuthConnectionResult",
+    "OAuthConnectionStatus",
+    "OAuthState",
+    "SelectedThreadsAccount",
+    "ThreadsAccount",
     "AutopostAccount",
     "AutopostErrorCode",
     "AutopostQueueClearResult",

@@ -67,6 +67,8 @@ async def pick_crawler_account(session: AsyncSession):
         LEFT JOIN search_quota sq
           ON sq.threads_account_id = ta.id AND sq.window_start = current_date
         WHERE ta.expires_at > now()
+          AND ta.connection_status = 'connected'
+          AND ta.access_token_enc IS NOT NULL
           AND coalesce(sq.used, 0) < :budget
         ORDER BY used ASC LIMIT 1
     """), {"budget": CRAWL_BUDGET_PER_ACC})).first()

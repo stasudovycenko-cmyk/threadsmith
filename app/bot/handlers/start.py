@@ -2,14 +2,13 @@
 Основные хендлеры: /start (регистрация + рефералка), баланс,
 подключение Threads, тарифы и оплата.
 """
-import uuid
-
 from aiogram import F, Router
 from aiogram.filters import CommandStart, CommandObject
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from sqlalchemy import text
 
+from app.core.accounts import ThreadsAccountService
 from app.core.config import PLANS
 from app.core.db import Session
 from app.core.robokassa import payment_link
@@ -26,6 +25,7 @@ def main_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🤖 Нейрокомментинг", callback_data="nc:menu")],
         [InlineKeyboardButton(text="📡 Радар", callback_data="rd:menu"),
          InlineKeyboardButton(text="🔗 Подключить Threads", callback_data="connect")],
+        [InlineKeyboardButton(text="👤 Личный кабинет", callback_data="cab:menu")],
         [InlineKeyboardButton(text="💳 Тарифы", callback_data="plans"),
          InlineKeyboardButton(text="⚡ Баланс", callback_data="balance")],
         [InlineKeyboardButton(text="📄 Документы", callback_data="docs:menu")],
@@ -99,22 +99,18 @@ async def cb_balance(cb: CallbackQuery):
 @router.callback_query(F.data == "connect")
 async def cb_connect(cb: CallbackQuery):
     async with Session() as s:
-        row = (await s.execute(text(
-            "SELECT id FROM users WHERE telegram_id = :tg"
-        ), {"tg": cb.from_user.id})).first()
-        if not row:
+        service = ThreadsAccountService(s)
+        user_id = await service.user_id_for_telegram(cb.from_user.id)
+        if user_id is None:
             await cb.answer("Жми /start сначала", show_alert=True)
             return
-        state = str(uuid.uuid4())
-        await s.execute(text("""
-            INSERT INTO oauth_states (state, user_id) VALUES (:st, :uid)
-        """), {"st": state, "uid": row[0]})
+        oauth = await service.create_oauth_state(user_id, action="connect")
         await s.commit()
 
     await cb.message.answer(
         "Подключение Threads-аккаунта. Жми, логинься, подтверждай доступы:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Подключить", url=auth_link(state))
+            InlineKeyboardButton(text="Подключить", url=auth_link(oauth.state))
         ]]),
     )
     await cb.answer()

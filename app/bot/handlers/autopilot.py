@@ -15,6 +15,7 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from sqlalchemy import text
 
+from app.core.accounts import ThreadsAccountService
 from app.core.autopost_status import (
     AutopostStatusService,
     render_clear_result,
@@ -53,13 +54,13 @@ def ap_kb() -> InlineKeyboardMarkup:
 
 async def _uid_and_acc(tg_id: int):
     async with Session() as s:
-        row = (await s.execute(text("""
-            SELECT u.id, ta.id FROM users u
-            LEFT JOIN threads_accounts ta ON ta.user_id = u.id
-            WHERE u.telegram_id = :tg
-            ORDER BY ta.created_at DESC LIMIT 1
-        """), {"tg": tg_id})).first()
-    return (row[0], row[1]) if row else (None, None)
+        service = ThreadsAccountService(s)
+        user_id = await service.user_id_for_telegram(tg_id)
+        if user_id is None:
+            return None, None
+        account = await service.selected_account(user_id)
+        await s.commit()
+    return user_id, account.id if account else None
 
 
 @router.callback_query(F.data == "ap:menu")
@@ -78,6 +79,7 @@ async def cb_new(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return
     await state.set_state(Schedule.body)
+    await state.update_data(account_id=acc)
     await cb.message.answer("Текст поста (до 500 символов):")
     await cb.answer()
 
@@ -126,7 +128,15 @@ async def sch_when(msg: Message, state: FSMContext):
 
     data = await state.get_data()
     await state.clear()
-    uid, acc = await _uid_and_acc(msg.from_user.id)
+    uid, _ = await _uid_and_acc(msg.from_user.id)
+    acc = data.get("account_id")
+    async with Session() as ownership_session:
+        owned = await ThreadsAccountService(
+            ownership_session
+        ).get_owned(uid, acc)
+    if owned is None or owned.connection_status != "connected":
+        await msg.answer("Threads-аккаунт не подключён.")
+        return
 
     async with Session() as s:
         await s.execute(text("""
