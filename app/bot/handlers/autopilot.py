@@ -15,6 +15,13 @@ from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from sqlalchemy import text
 
+from app.core.autopost_status import (
+    AutopostStatusService,
+    render_clear_result,
+    render_queue_summary,
+    render_rebuild_result,
+    resolve_timezone,
+)
 from app.core.db import Session
 
 log = logging.getLogger("autopilot_bot")
@@ -137,43 +144,228 @@ async def sch_when(msg: Message, state: FSMContext):
 # ---------- очередь ----------
 
 @router.callback_query(F.data == "ap:queue")
+@router.callback_query(F.data.startswith("ap:queue:"))
 async def cb_queue(cb: CallbackQuery):
-    uid, _ = await _uid_and_acc(cb.from_user.id)
-    async with Session() as s:
-        rows = (await s.execute(text("""
-            SELECT id, text, run_at, status FROM scheduled_posts
-            WHERE user_id = :uid AND status IN ('pending', 'publishing')
-            ORDER BY run_at LIMIT 10
-        """), {"uid": uid})).all()
-    if not rows:
-        await cb.message.answer("Очередь пустая.")
-        await cb.answer()
+    uid, latest_account_id = await _uid_and_acc(cb.from_user.id)
+    try:
+        account_id = int(cb.data.rsplit(":", 1)[1])
+    except (TypeError, ValueError):
+        account_id = latest_account_id
+    if uid is None or account_id is None:
+        await cb.answer("Threads-аккаунт не найден", show_alert=True)
         return
+    async with Session() as s:
+        service = AutopostStatusService(s)
+        summary = await service.queue_summary(uid, account_id)
+        accounts = await service.list_accounts(uid)
+        if summary is None:
+            await cb.answer("Аккаунт не найден", show_alert=True)
+            return
+        rows = (await s.execute(text("""
+            SELECT
+              post.id, post.text, post.run_at, post.status,
+              (
+                post.content_metadata ->> 'source' = 'autocontent'
+                OR EXISTS (
+                  SELECT 1 FROM autopost_runs run
+                  WHERE run.scheduled_post_id = post.id
+                )
+              ) AS is_auto
+            FROM scheduled_posts post
+            WHERE post.user_id = :uid
+              AND post.threads_account_id = :account_id
+              AND post.status IN ('pending', 'publishing')
+            ORDER BY post.run_at, post.id
+            LIMIT 10
+        """), {"uid": uid, "account_id": account_id})).all()
     kb = []
-    lines = []
-    for n, (pid, body, run_at, status) in enumerate(rows, 1):
+    if len(accounts) > 1:
+        for account in accounts:
+            label = f"@{account.username or account.id}"
+            if account.id == account_id:
+                label = "✅ " + label
+            kb.append([InlineKeyboardButton(
+                text=label,
+                callback_data=f"ap:queue:{account.id}",
+            )])
+    kb.extend([
+        [InlineKeyboardButton(
+            text="🔄 Перестроить очередь",
+            callback_data=f"ap:q_rebuild:{account_id}",
+        )],
+        [InlineKeyboardButton(
+            text="🗑 Очистить очередь",
+            callback_data=f"ap:q_clear:{account_id}",
+        )],
+    ])
+    tz = resolve_timezone(summary.settings.timezone)
+    for pid, body, run_at, status, is_auto in rows:
         preview = " ".join(body.split())[:30]
-        when = run_at.astimezone(MSK).strftime("%d.%m %H:%M")
-        kb.append([InlineKeyboardButton(text=when + " · " + preview,
-                                        callback_data=f"ap:view:{pid}")])
+        when = run_at.astimezone(tz).strftime("%d.%m %H:%M")
+        source = "Авто" if is_auto else "Вручную"
+        kb.append([InlineKeyboardButton(
+            text=f"{source} · {when} · {preview}",
+            callback_data=f"ap:view:{pid}:{account_id}",
+        )])
+    kb.extend([
+        [InlineKeyboardButton(
+            text="🔄 Обновить",
+            callback_data=f"ap:queue:{account_id}",
+        )],
+        [InlineKeyboardButton(
+            text="⬅️ Назад",
+            callback_data=f"ac:menu:{account_id}",
+        )],
+    ])
     await cb.message.answer(
-        "Очередь на публикацию (мск). Жми пост, чтобы открыть:",
+        render_queue_summary(summary),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
     )
     await cb.answer()
 
 
+@router.callback_query(F.data.startswith("ap:q_rebuild:"))
+async def cb_queue_rebuild(cb: CallbackQuery):
+    uid, _ = await _uid_and_acc(cb.from_user.id)
+    account_id = int(cb.data.rsplit(":", 1)[1])
+    await cb.answer("Перестраиваю очередь...")
+    async with Session() as session:
+        service = AutopostStatusService(session)
+        try:
+            result = await service.rebuild_queue(uid, account_id)
+            status = await service.get_status(uid, account_id)
+            await session.commit()
+        except Exception as error:
+            await session.rollback()
+            log.error(
+                "queue rebuild failed uid=%s account=%s error_type=%s",
+                uid,
+                account_id,
+                type(error).__name__,
+            )
+            await cb.message.answer("Не удалось перестроить очередь.")
+            return
+    await cb.message.answer(
+        render_rebuild_result(result, status.settings.timezone),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="📋 К очереди",
+                callback_data=f"ap:queue:{account_id}",
+            )
+        ]]),
+    )
+
+
+@router.callback_query(F.data.startswith("ap:q_clear:"))
+async def cb_queue_clear_confirm(cb: CallbackQuery):
+    account_id = int(cb.data.rsplit(":", 1)[1])
+    await cb.message.answer(
+        "⚠️ Очистить очередь автопостинга?\n\n"
+        "Будут удалены все будущие неопубликованные посты этого "
+        "Threads-аккаунта.\n\n"
+        "Потраченные на генерацию кредиты не возвращаются.\n\n"
+        "Опубликованные посты и история запусков останутся.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🗑 Очистить и оставить включённым",
+                callback_data=f"ap:q_clear_keep:{account_id}",
+            )],
+            [InlineKeyboardButton(
+                text="⏸ Очистить и выключить автопостинг",
+                callback_data=f"ap:q_clear_disable:{account_id}",
+            )],
+            [InlineKeyboardButton(
+                text="⬅️ Отмена",
+                callback_data=f"ap:queue:{account_id}",
+            )],
+        ]),
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("ap:q_clear_keep:"))
+@router.callback_query(F.data.startswith("ap:q_clear_disable:"))
+async def cb_queue_clear(cb: CallbackQuery):
+    uid, _ = await _uid_and_acc(cb.from_user.id)
+    account_id = int(cb.data.rsplit(":", 1)[1])
+    disable = cb.data.startswith("ap:q_clear_disable:")
+    await cb.answer("Очищаю очередь...")
+    async with Session() as session:
+        try:
+            result = await AutopostStatusService(session).clear_queue(
+                uid,
+                account_id,
+                disable_autoposting=disable,
+            )
+            await session.commit()
+        except Exception as error:
+            await session.rollback()
+            log.error(
+                "queue clear failed uid=%s account=%s error_type=%s",
+                uid,
+                account_id,
+                type(error).__name__,
+            )
+            await cb.message.answer("Не удалось очистить очередь.")
+            return
+    await cb.message.answer(
+        render_clear_result(result),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="📋 К очереди",
+                callback_data=f"ap:queue:{account_id}",
+            )
+        ]]),
+    )
+
+
 @router.callback_query(F.data.startswith("ap:del:"))
 async def cb_del(cb: CallbackQuery):
-    pid = int(cb.data.rsplit(":", 1)[1])
-    uid, _ = await _uid_and_acc(cb.from_user.id)
+    parts = cb.data.split(":")
+    pid = int(parts[2])
+    callback_account_id = int(parts[3]) if len(parts) > 3 else None
+    uid, latest_account_id = await _uid_and_acc(cb.from_user.id)
+    account_id = callback_account_id or latest_account_id
     async with Session() as s:
-        # снимаем только pending - publishing уже в полёте, его не трогаем
+        service = AutopostStatusService(s)
+        await service.lock_queue(uid, account_id)
+        removable = (await s.execute(text("""
+            SELECT id
+            FROM scheduled_posts
+            WHERE id = :pid
+              AND user_id = :uid
+              AND threads_account_id = :account_id
+              AND status = 'pending'
+            FOR UPDATE SKIP LOCKED
+        """), {
+            "pid": pid,
+            "uid": uid,
+            "account_id": account_id,
+        })).first()
+        if removable:
+            await s.execute(text("""
+                UPDATE autopost_runs
+                SET status = 'skipped',
+                    finished_at = now(),
+                    error_code = NULL,
+                    safe_error_message = 'Пропущено: пост снят из очереди'
+                WHERE scheduled_post_id = :pid
+                  AND status = 'pending'
+            """), {"pid": pid})
         row = (await s.execute(text("""
             DELETE FROM scheduled_posts
-            WHERE id = :pid AND user_id = :uid AND status = 'pending'
+            WHERE id = :pid
+              AND user_id = :uid
+              AND threads_account_id = :account_id
+              AND status = 'pending'
+              AND :removable
             RETURNING id
-        """), {"pid": pid, "uid": uid})).first()
+        """), {
+            "pid": pid,
+            "uid": uid,
+            "account_id": account_id,
+            "removable": bool(removable),
+        })).first()
         await s.commit()
     await cb.answer("Снял" if row else "Уже публикуется, поздно", show_alert=not row)
 
@@ -261,21 +453,43 @@ async def cb_rule_del(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("ap:view:"))
 async def cb_view(cb: CallbackQuery):
-    pid = int(cb.data.rsplit(":", 1)[1])
-    uid, _ = await _uid_and_acc(cb.from_user.id)
+    parts = cb.data.split(":")
+    pid = int(parts[2])
+    callback_account_id = int(parts[3]) if len(parts) > 3 else None
+    uid, latest_account_id = await _uid_and_acc(cb.from_user.id)
+    account_id = callback_account_id or latest_account_id
     async with Session() as s:
-        row = (await s.execute(text(
-            "SELECT text, run_at, status FROM scheduled_posts "
-            "WHERE id = :pid AND user_id = :uid"), {"pid": pid, "uid": uid})).first()
+        row = (await s.execute(text("""
+            SELECT post.text, post.run_at, post.status,
+                   coalesce(ac.timezone, 'Europe/Moscow')
+            FROM scheduled_posts post
+            LEFT JOIN autocontent_settings ac
+              ON ac.user_id = post.user_id
+            WHERE post.id = :pid
+              AND post.user_id = :uid
+              AND post.threads_account_id = :account_id
+        """), {
+            "pid": pid,
+            "uid": uid,
+            "account_id": account_id,
+        })).first()
     if not row:
         await cb.answer("Не нашёл", show_alert=True)
         return
-    body, run_at, status = row
-    when = run_at.astimezone(MSK).strftime("%d.%m %H:%M мск")
+    body, run_at, status, timezone_name = row
+    when = run_at.astimezone(
+        resolve_timezone(timezone_name)
+    ).strftime("%d.%m %H:%M")
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Опубликовать сейчас", callback_data=f"ap:now:{pid}")],
-        [InlineKeyboardButton(text="❌ Снять", callback_data=f"ap:del:{pid}")],
-        [InlineKeyboardButton(text="📋 К очереди", callback_data="ap:queue")],
+        [InlineKeyboardButton(
+            text="❌ Снять",
+            callback_data=f"ap:del:{pid}:{account_id}",
+        )],
+        [InlineKeyboardButton(
+            text="📋 К очереди",
+            callback_data=f"ap:queue:{account_id}",
+        )],
     ])
     head = "Пост на " + when + " · " + status + " · " + str(len(body)) + " симв."
     await cb.message.answer(head + chr(10) + chr(10) + body, reply_markup=kb)

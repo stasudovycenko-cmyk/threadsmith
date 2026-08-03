@@ -18,6 +18,11 @@ from app.core.threads_api import ThreadsAPIError
 from app.schemas.autopost import (
     AutopostAccount,
     AutopostErrorCode,
+    AutopostQueueClearResult,
+    AutopostQueueDay,
+    AutopostQueueItem,
+    AutopostQueueRebuildResult,
+    AutopostQueueSummary,
     AutopostRun,
     AutopostSettings,
     AutopostStatus,
@@ -29,6 +34,9 @@ SCHEDULE_LEAD_MINUTES = 10
 MISFIRE_GRACE_MINUTES = 10
 STALE_GENERATION_MINUTES = 30
 STALE_PUBLISH_MINUTES = 15
+PLANNING_ACTIVE_DAYS = 4
+PLANNING_SEARCH_DAYS = 32
+QUEUE_CLEARED_MESSAGE = "Пропущено: очередь очищена"
 
 SAFE_ERROR_MESSAGES: dict[AutopostErrorCode, str] = {
     "AUTH_EXPIRED": "Истекла авторизация Threads",
@@ -116,12 +124,26 @@ _HISTORY_SQL = text("""
 """)
 
 _OCCUPIED_SQL = text("""
-    SELECT scheduled_at
-    FROM autopost_runs
-    WHERE user_id = :uid
-      AND threads_account_id = :account_id
-      AND scheduled_at >= :window_start
-      AND scheduled_at < :window_end
+    SELECT coalesce(post.run_at, run.scheduled_at) AS scheduled_at
+    FROM autopost_runs run
+    LEFT JOIN scheduled_posts post ON post.id = run.scheduled_post_id
+    WHERE run.user_id = :uid
+      AND run.threads_account_id = :account_id
+      AND run.status IN ('pending', 'success')
+      AND coalesce(post.run_at, run.scheduled_at) >= :window_start
+      AND coalesce(post.run_at, run.scheduled_at) < :window_end
+      AND (
+        post.id IS NULL
+        OR post.status IN ('pending', 'publishing', 'done')
+      )
+      AND (
+        run.scheduled_post_id IS NULL
+        OR NOT (
+          run.scheduled_post_id = ANY(
+            CAST(:exclude_post_ids AS bigint[])
+          )
+        )
+      )
     UNION
     SELECT sp.run_at AS scheduled_at
     FROM scheduled_posts sp
@@ -129,12 +151,45 @@ _OCCUPIED_SQL = text("""
       AND sp.threads_account_id = :account_id
       AND sp.run_at >= :window_start
       AND sp.run_at < :window_end
-      AND sp.status IN ('pending', 'publishing', 'done', 'failed')
+      AND sp.status IN ('pending', 'publishing', 'done')
       AND sp.content_metadata ->> 'source' = 'autocontent'
+      AND NOT (sp.id = ANY(CAST(:exclude_post_ids AS bigint[])))
       AND NOT EXISTS (
         SELECT 1 FROM autopost_runs run
         WHERE run.scheduled_post_id = sp.id
       )
+""")
+
+_MANUAL_BLOCKED_SQL = text("""
+    SELECT post.run_at
+    FROM scheduled_posts post
+    WHERE post.user_id = :uid
+      AND post.threads_account_id = :account_id
+      AND post.run_at >= :window_start
+      AND post.run_at < :window_end
+      AND post.status IN ('pending', 'publishing')
+      AND coalesce(post.content_metadata ->> 'source', '') <> 'autocontent'
+      AND NOT EXISTS (
+        SELECT 1 FROM autopost_runs run
+        WHERE run.scheduled_post_id = post.id
+      )
+""")
+
+_AUTO_QUEUE_SQL = text("""
+    SELECT post.id, post.text, post.run_at
+    FROM scheduled_posts post
+    WHERE post.user_id = :uid
+      AND post.threads_account_id = :account_id
+      AND post.status = 'pending'
+      AND post.run_at > :now
+      AND (
+        post.content_metadata ->> 'source' = 'autocontent'
+        OR EXISTS (
+          SELECT 1 FROM autopost_runs run
+          WHERE run.scheduled_post_id = post.id
+        )
+      )
+    ORDER BY post.run_at, post.id
 """)
 
 
@@ -211,43 +266,146 @@ def select_next_slots(
     timezone_name: str,
     posts_per_day: int,
     occupied: Sequence[datetime] = (),
+    blocked: Sequence[datetime] = (),
     lead_minutes: int = SCHEDULE_LEAD_MINUTES,
     horizon_days: int = 8,
 ) -> tuple[datetime, ...]:
-    if not slots or posts_per_day <= 0:
+    selected = select_planning_slots(
+        now=now,
+        slots=slots,
+        days=days,
+        timezone_name=timezone_name,
+        posts_per_day=posts_per_day,
+        occupied=occupied,
+        blocked=blocked,
+        lead_minutes=lead_minutes,
+        active_days=horizon_days + 1,
+        search_calendar_days=horizon_days + 1,
+    )
+    if not selected:
+        return ()
+    tz = resolve_timezone(timezone_name)
+    first_day = selected[0].astimezone(tz).date()
+    return tuple(
+        candidate
+        for candidate in selected
+        if candidate.astimezone(tz).date() == first_day
+    )
+
+
+def is_active_day(value: date, days: str) -> bool:
+    return not (days == "weekdays" and value.weekday() >= 5)
+
+
+def select_planning_slots(
+    *,
+    now: datetime,
+    slots: Sequence[time],
+    days: str,
+    timezone_name: str,
+    posts_per_day: int,
+    occupied: Sequence[datetime] = (),
+    blocked: Sequence[datetime] = (),
+    lead_minutes: int = SCHEDULE_LEAD_MINUTES,
+    active_days: int = PLANNING_ACTIVE_DAYS,
+    required_slots: int | None = None,
+    search_calendar_days: int = PLANNING_SEARCH_DAYS,
+) -> tuple[datetime, ...]:
+    """Return every free slot in deterministic local-day order."""
+    if (
+        not slots
+        or posts_per_day <= 0
+        or active_days <= 0
+        or required_slots == 0
+    ):
         return ()
     tz = resolve_timezone(timezone_name)
     local_now = ensure_aware(now).astimezone(tz)
-    earliest = local_now + timedelta(minutes=max(0, lead_minutes))
+    earliest = (
+        local_now + timedelta(minutes=max(0, lead_minutes))
+    ).replace(second=0, microsecond=0)
     occupied_local = [
         ensure_aware(item).astimezone(tz).replace(second=0, microsecond=0)
         for item in occupied
     ]
+    blocked_local = {
+        ensure_aware(item).astimezone(tz).replace(second=0, microsecond=0)
+        for item in blocked
+    }
     occupied_counts = Counter(item.date() for item in occupied_local)
     occupied_minutes = set(occupied_local)
+    selected: list[datetime] = []
+    active_seen = 0
 
-    for offset in range(horizon_days + 1):
+    for offset in range(max(1, search_calendar_days)):
         candidate_date = local_now.date() + timedelta(days=offset)
-        if days == "weekdays" and candidate_date.weekday() >= 5:
+        if not is_active_day(candidate_date, days):
             continue
-        remaining = posts_per_day - occupied_counts[candidate_date]
-        if remaining <= 0:
-            continue
-        selected = []
+        active_seen += 1
+        remaining = max(
+            0,
+            posts_per_day - occupied_counts[candidate_date],
+        )
         for slot in sorted(set(slots)):
+            if remaining <= 0:
+                break
             candidate = datetime.combine(
                 candidate_date,
                 slot,
                 tzinfo=tz,
             ).replace(second=0, microsecond=0)
-            if candidate < earliest or candidate in occupied_minutes:
+            if (
+                candidate < earliest
+                or candidate in occupied_minutes
+                or candidate in blocked_local
+            ):
                 continue
             selected.append(candidate.astimezone(timezone.utc))
-            if len(selected) >= remaining:
-                break
-        if selected:
-            return tuple(selected)
-    return ()
+            remaining -= 1
+            if required_slots is not None and len(selected) >= required_slots:
+                return tuple(selected)
+        if required_slots is None and active_seen >= active_days:
+            break
+    return tuple(selected)
+
+
+def available_day_capacity(
+    *,
+    now: datetime,
+    day: date,
+    slots: Sequence[time],
+    days: str,
+    timezone_name: str,
+    posts_per_day: int,
+    blocked: Sequence[datetime] = (),
+    lead_minutes: int = SCHEDULE_LEAD_MINUTES,
+) -> int:
+    if not is_active_day(day, days):
+        return 0
+    tz = resolve_timezone(timezone_name)
+    local_now = ensure_aware(now).astimezone(tz)
+    earliest = local_now + timedelta(minutes=max(0, lead_minutes))
+    blocked_local = {
+        ensure_aware(value).astimezone(tz).replace(
+            second=0,
+            microsecond=0,
+        )
+        for value in blocked
+    }
+    available = sum(
+        datetime.combine(day, slot, tzinfo=tz) >= earliest
+        and datetime.combine(day, slot, tzinfo=tz) not in blocked_local
+        for slot in sorted(set(slots))
+    )
+    return min(max(0, posts_per_day), available)
+
+
+def queue_summary_dates(local_today: date, days: str) -> tuple[date, ...]:
+    tomorrow = local_today + timedelta(days=1)
+    next_active = tomorrow + timedelta(days=1)
+    while not is_active_day(next_active, days):
+        next_active += timedelta(days=1)
+    return local_today, tomorrow, next_active
 
 
 def normalize_error(
@@ -379,6 +537,7 @@ class AutopostStatusService:
             window_start, window_end = schedule_window(
                 current,
                 settings.timezone,
+                days=PLANNING_SEARCH_DAYS,
             )
             occupied_rows = (
                 await self.session.execute(
@@ -388,10 +547,23 @@ class AutopostStatusService:
                         "account_id": account_id,
                         "window_start": window_start,
                         "window_end": window_end,
+                        "exclude_post_ids": [],
                     },
                 )
             ).all()
             occupied = [row[0] for row in occupied_rows if row[0]]
+            blocked_rows = (
+                await self.session.execute(
+                    _MANUAL_BLOCKED_SQL,
+                    {
+                        "uid": user_id,
+                        "account_id": account_id,
+                        "window_start": window_start,
+                        "window_end": window_end,
+                    },
+                )
+            ).all()
+            blocked = [row[0] for row in blocked_rows if row[0]]
             candidates = select_next_slots(
                 now=current,
                 slots=settings.slots,
@@ -399,6 +571,7 @@ class AutopostStatusService:
                 timezone_name=settings.timezone,
                 posts_per_day=settings.posts_per_day,
                 occupied=occupied,
+                blocked=blocked,
             )
             next_run_at = candidates[0] if candidates else None
 
@@ -445,6 +618,16 @@ class AutopostStatusService:
         ).mappings().all()
         return [_run_from_row(row) for row in rows]
 
+    async def lock_queue(self, user_id: int, account_id: int) -> None:
+        await self.session.execute(
+            text("""
+                SELECT pg_advisory_xact_lock(
+                    hashtextextended(:lock_scope, 0)
+                )
+            """),
+            {"lock_scope": f"autopost_queue:{user_id}:{account_id}"},
+        )
+
     async def occupied_slots(
         self,
         user_id: int,
@@ -452,11 +635,43 @@ class AutopostStatusService:
         *,
         now: datetime,
         timezone_name: str,
+        exclude_post_ids: Sequence[int] = (),
     ) -> list[datetime]:
-        window_start, window_end = schedule_window(now, timezone_name)
+        window_start, window_end = schedule_window(
+            now,
+            timezone_name,
+            days=PLANNING_SEARCH_DAYS,
+        )
         rows = (
             await self.session.execute(
                 _OCCUPIED_SQL,
+                {
+                    "uid": user_id,
+                    "account_id": account_id,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "exclude_post_ids": list(exclude_post_ids),
+                },
+            )
+        ).all()
+        return [row[0] for row in rows if row[0]]
+
+    async def blocked_manual_slots(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        now: datetime,
+        timezone_name: str,
+    ) -> list[datetime]:
+        window_start, window_end = schedule_window(
+            now,
+            timezone_name,
+            days=PLANNING_SEARCH_DAYS,
+        )
+        rows = (
+            await self.session.execute(
+                _MANUAL_BLOCKED_SQL,
                 {
                     "uid": user_id,
                     "account_id": account_id,
@@ -487,8 +702,7 @@ class AutopostStatusService:
                         WHERE user_id = :uid
                           AND active
                     )
-                    ON CONFLICT (threads_account_id, scheduled_at)
-                    DO NOTHING
+                    ON CONFLICT DO NOTHING
                     RETURNING id
                 """),
                 {
@@ -499,6 +713,392 @@ class AutopostStatusService:
             )
         ).first()
         return row[0] if row else None
+
+    async def reserve_next_run(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        settings: AutopostSettings,
+        now: datetime,
+    ) -> tuple[int, datetime] | None:
+        await self.lock_queue(user_id, account_id)
+        occupied = await self.occupied_slots(
+            user_id,
+            account_id,
+            now=now,
+            timezone_name=settings.timezone,
+        )
+        blocked = await self.blocked_manual_slots(
+            user_id,
+            account_id,
+            now=now,
+            timezone_name=settings.timezone,
+        )
+        candidates = select_planning_slots(
+            now=now,
+            slots=settings.slots,
+            days=settings.days,
+            timezone_name=settings.timezone,
+            posts_per_day=settings.posts_per_day,
+            occupied=occupied,
+            blocked=blocked,
+        )
+        for scheduled_at in candidates:
+            run_id = await self.reserve_run(
+                user_id,
+                account_id,
+                scheduled_at,
+            )
+            if run_id is not None:
+                return run_id, scheduled_at
+        return None
+
+    async def queue_summary(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> AutopostQueueSummary | None:
+        current = ensure_aware(now or utc_now())
+        status = await self.get_status(
+            user_id,
+            account_id,
+            now=current,
+        )
+        if status is None:
+            return None
+        rows = (
+            await self.session.execute(
+                _AUTO_QUEUE_SQL,
+                {
+                    "uid": user_id,
+                    "account_id": account_id,
+                    "now": current,
+                },
+            )
+        ).mappings().all()
+        posts = tuple(
+            AutopostQueueItem(
+                id=row["id"],
+                text=row["text"],
+                run_at=row["run_at"],
+            )
+            for row in rows
+        )
+        tz = resolve_timezone(status.settings.timezone)
+        local_today = current.astimezone(tz).date()
+        counts = Counter(
+            ensure_aware(post.run_at).astimezone(tz).date()
+            for post in posts
+        )
+        blocked = await self.blocked_manual_slots(
+            user_id,
+            account_id,
+            now=current,
+            timezone_name=status.settings.timezone,
+        )
+        summary_days = queue_summary_dates(
+            local_today,
+            status.settings.days,
+        )
+        days = tuple(
+            AutopostQueueDay(
+                day=day,
+                queued=counts[day],
+                capacity=available_day_capacity(
+                    now=current,
+                    day=day,
+                    slots=status.settings.slots,
+                    days=status.settings.days,
+                    timezone_name=status.settings.timezone,
+                    posts_per_day=status.settings.posts_per_day,
+                    blocked=blocked,
+                ),
+            )
+            for day in summary_days
+        )
+        return AutopostQueueSummary(
+            account=status.account,
+            settings=status.settings,
+            posts=posts,
+            days=days,
+        )
+
+    async def rebuild_queue(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        now: datetime | None = None,
+    ) -> AutopostQueueRebuildResult:
+        current = ensure_aware(now or utc_now())
+        status = await self.get_status(
+            user_id,
+            account_id,
+            now=current,
+        )
+        if status is None:
+            raise ValueError("Threads account not found")
+        await self.lock_queue(user_id, account_id)
+        rows = (
+            await self.session.execute(
+                text("""
+                    SELECT post.id, post.text, post.run_at
+                    FROM scheduled_posts post
+                    WHERE post.user_id = :uid
+                      AND post.threads_account_id = :account_id
+                      AND post.status = 'pending'
+                      AND post.run_at > :now
+                      AND (
+                        post.content_metadata ->> 'source' = 'autocontent'
+                        OR EXISTS (
+                          SELECT 1 FROM autopost_runs run
+                          WHERE run.scheduled_post_id = post.id
+                        )
+                      )
+                    ORDER BY post.run_at, post.id
+                    FOR UPDATE OF post SKIP LOCKED
+                """),
+                {
+                    "uid": user_id,
+                    "account_id": account_id,
+                    "now": current,
+                },
+            )
+        ).mappings().all()
+        if not rows:
+            return AutopostQueueRebuildResult(
+                moved_posts=0,
+                posts_per_day=status.settings.posts_per_day,
+            )
+        post_ids = [int(row["id"]) for row in rows]
+        occupied = await self.occupied_slots(
+            user_id,
+            account_id,
+            now=current,
+            timezone_name=status.settings.timezone,
+            exclude_post_ids=post_ids,
+        )
+        blocked = await self.blocked_manual_slots(
+            user_id,
+            account_id,
+            now=current,
+            timezone_name=status.settings.timezone,
+        )
+        schedule = select_planning_slots(
+            now=current,
+            slots=status.settings.slots,
+            days=status.settings.days,
+            timezone_name=status.settings.timezone,
+            posts_per_day=status.settings.posts_per_day,
+            occupied=occupied,
+            blocked=blocked,
+            active_days=PLANNING_ACTIVE_DAYS,
+            required_slots=len(rows),
+            search_calendar_days=max(
+                PLANNING_SEARCH_DAYS,
+                len(rows) * 3 + 7,
+            ),
+        )
+        if len(schedule) < len(rows):
+            raise ValueError("Not enough configured future slots")
+
+        await self.session.execute(
+            text("""
+                UPDATE autopost_runs
+                SET status = 'skipped'
+                WHERE scheduled_post_id = ANY(
+                    CAST(:post_ids AS bigint[])
+                )
+                  AND status = 'pending'
+            """),
+            {"post_ids": post_ids},
+        )
+        moved = 0
+        for row, scheduled_at in zip(rows, schedule):
+            post_id = int(row["id"])
+            if ensure_aware(row["run_at"]) != scheduled_at:
+                moved += 1
+            updated = (
+                await self.session.execute(
+                    text("""
+                        UPDATE scheduled_posts
+                        SET run_at = :scheduled_at
+                        WHERE id = :post_id
+                          AND user_id = :uid
+                          AND threads_account_id = :account_id
+                          AND status = 'pending'
+                        RETURNING id
+                    """),
+                    {
+                        "scheduled_at": scheduled_at,
+                        "post_id": post_id,
+                        "uid": user_id,
+                        "account_id": account_id,
+                    },
+                )
+            ).first()
+            if updated is None:
+                raise RuntimeError("Queue post changed during rebuild")
+            run = (
+                await self.session.execute(
+                    text("""
+                        UPDATE autopost_runs
+                        SET scheduled_at = :scheduled_at,
+                            status = 'pending',
+                            finished_at = NULL,
+                            error_code = NULL,
+                            safe_error_message = NULL
+                        WHERE scheduled_post_id = :post_id
+                          AND status = 'skipped'
+                          AND finished_at IS NULL
+                        RETURNING id
+                    """),
+                    {
+                        "scheduled_at": scheduled_at,
+                        "post_id": post_id,
+                    },
+                )
+            ).first()
+            if run is None:
+                await self.session.execute(
+                    text("""
+                        INSERT INTO autopost_runs (
+                            user_id, threads_account_id,
+                            scheduled_post_id, scheduled_at,
+                            started_at, status
+                        ) VALUES (
+                            :uid, :account_id, :post_id,
+                            :scheduled_at, now(), 'pending'
+                        )
+                    """),
+                    {
+                        "uid": user_id,
+                        "account_id": account_id,
+                        "post_id": post_id,
+                        "scheduled_at": scheduled_at,
+                    },
+                )
+        tz = resolve_timezone(status.settings.timezone)
+        filled_days = len({
+            ensure_aware(value).astimezone(tz).date()
+            for value in schedule
+        })
+        today = current.astimezone(tz).date()
+        return AutopostQueueRebuildResult(
+            moved_posts=moved,
+            first_post_at=schedule[0],
+            filled_days=filled_days,
+            posts_per_day=status.settings.posts_per_day,
+            today_has_no_slots=(
+                ensure_aware(schedule[0]).astimezone(tz).date()
+                != today
+            ),
+        )
+
+    async def clear_queue(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        disable_autoposting: bool,
+        now: datetime | None = None,
+    ) -> AutopostQueueClearResult:
+        current = ensure_aware(now or utc_now())
+        status = await self.get_status(
+            user_id,
+            account_id,
+            now=current,
+        )
+        if status is None:
+            raise ValueError("Threads account not found")
+        await self.lock_queue(user_id, account_id)
+        rows = (
+            await self.session.execute(
+                text("""
+                    SELECT post.id
+                    FROM scheduled_posts post
+                    WHERE post.user_id = :uid
+                      AND post.threads_account_id = :account_id
+                      AND post.status = 'pending'
+                      AND post.run_at > :now
+                      AND (
+                        post.content_metadata ->> 'source' = 'autocontent'
+                        OR EXISTS (
+                          SELECT 1 FROM autopost_runs run
+                          WHERE run.scheduled_post_id = post.id
+                        )
+                      )
+                    FOR UPDATE OF post SKIP LOCKED
+                """),
+                {
+                    "uid": user_id,
+                    "account_id": account_id,
+                    "now": current,
+                },
+            )
+        ).all()
+        post_ids = [int(row[0]) for row in rows]
+        await self.session.execute(
+            text("""
+                UPDATE autopost_runs
+                SET status = 'skipped',
+                    finished_at = :now,
+                    error_code = NULL,
+                    safe_error_message = :message
+                WHERE user_id = :uid
+                  AND threads_account_id = :account_id
+                  AND status = 'pending'
+                  AND scheduled_at > :now
+                  AND (
+                    scheduled_post_id IS NULL
+                    OR scheduled_post_id = ANY(
+                      CAST(:post_ids AS bigint[])
+                    )
+                  )
+            """),
+            {
+                "uid": user_id,
+                "account_id": account_id,
+                "now": current,
+                "post_ids": post_ids,
+                "message": QUEUE_CLEARED_MESSAGE,
+            },
+        )
+        deleted = []
+        if post_ids:
+            deleted = (
+                await self.session.execute(
+                    text("""
+                        DELETE FROM scheduled_posts
+                        WHERE id = ANY(CAST(:post_ids AS bigint[]))
+                          AND user_id = :uid
+                          AND threads_account_id = :account_id
+                          AND status = 'pending'
+                        RETURNING id
+                    """),
+                    {
+                        "post_ids": post_ids,
+                        "uid": user_id,
+                        "account_id": account_id,
+                    },
+                )
+            ).all()
+        if disable_autoposting:
+            await self.session.execute(
+                text("""
+                    UPDATE autocontent_settings
+                    SET active = false
+                    WHERE user_id = :uid
+                """),
+                {"uid": user_id},
+            )
+        return AutopostQueueClearResult(
+            deleted_posts=len(deleted),
+            autoposting_disabled=disable_autoposting,
+        )
 
     async def attach_post(self, run_id: int, post_id: int) -> None:
         await self.session.execute(
@@ -916,3 +1516,81 @@ def render_history(
             "",
         ])
     return "\n".join(lines).rstrip()
+
+
+def render_queue_summary(summary: AutopostQueueSummary) -> str:
+    """Render the account-local automatic queue overview."""
+    lines = [
+        "📋 Очередь автопостинга",
+        "",
+        f"Аккаунт: @{summary.account.username or summary.account.id}",
+        f"Постов в день: {summary.settings.posts_per_day}",
+        f"Часовой пояс: {summary.settings.timezone}",
+        f"Будущих постов: {len(summary.posts)}",
+    ]
+    labels = ("Сегодня", "Завтра", "Следующий активный день")
+    for index, day in enumerate(summary.days[:3]):
+        label = labels[index]
+        if index == 2:
+            label = f"{label} ({day.day:%d.%m})"
+        if not is_active_day(day.day, summary.settings.days):
+            lines.append(f"{label}: неактивный день")
+        else:
+            lines.append(
+                f"{label}: {day.queued} из {day.capacity} "
+                "доступных слотов"
+            )
+    return "\n".join(lines)
+
+
+def render_rebuild_result(
+    result: AutopostQueueRebuildResult,
+    timezone_name: str,
+    *,
+    now: datetime | None = None,
+) -> str:
+    lines = ["✅ Очередь перестроена", ""]
+    if result.first_post_at is None:
+        lines.append("Будущих автопостов в очереди нет.")
+        return "\n".join(lines)
+    current = ensure_aware(now or utc_now())
+    tz = resolve_timezone(timezone_name)
+    local_first = ensure_aware(result.first_post_at).astimezone(tz)
+    local_today = current.astimezone(tz).date()
+    if local_first.date() == local_today:
+        first_label = f"сегодня в {local_first:%H:%M}"
+    elif local_first.date() == local_today + timedelta(days=1):
+        first_label = f"завтра в {local_first:%H:%M}"
+    else:
+        first_label = f"{local_first:%d.%m} в {local_first:%H:%M}"
+    lines.extend([
+        f"Перенесено постов: {result.moved_posts}",
+        f"Первый пост: {first_label}",
+        f"Заполнено дней: {result.filled_days}",
+        f"Постов в день: {result.posts_per_day}",
+    ])
+    if result.today_has_no_slots:
+        lines.extend([
+            "",
+            "Сегодня свободных слотов больше нет. Очередь начнётся "
+            "со следующего активного дня.",
+        ])
+    return "\n".join(lines)
+
+
+def render_clear_result(result: AutopostQueueClearResult) -> str:
+    lines = [
+        "✅ Очередь очищена",
+        "",
+        f"Удалено будущих постов: {result.deleted_posts}",
+        "Возвращено кредитов: 0",
+    ]
+    if result.autoposting_disabled:
+        lines.extend(["", "Автопостинг выключен."])
+    else:
+        lines.extend([
+            "",
+            "Автопостинг остаётся включён, поэтому planner снова "
+            "начнёт создавать новые посты.",
+        ])
+    return "\n".join(lines)

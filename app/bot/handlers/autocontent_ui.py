@@ -150,6 +150,10 @@ def _menu_kb(status, accounts) -> InlineKeyboardMarkup:
             callback_data=f"ac:goal:{account_id}",
         )],
         [InlineKeyboardButton(
+            text="📋 Очередь",
+            callback_data=f"ap:queue:{account_id}",
+        )],
+        [InlineKeyboardButton(
             text="📋 История",
             callback_data=f"ac:history:{account_id}",
         )],
@@ -177,6 +181,32 @@ async def _answer_status(
     await message.answer(
         render_status(status),
         reply_markup=_menu_kb(status, accounts),
+    )
+
+
+async def _answer_schedule_changed(
+    message: Message,
+    uid: int,
+    account_id: int | None,
+) -> None:
+    status, _ = await _load_menu(uid, account_id)
+    if status is None:
+        await message.answer("Threads-аккаунт не найден.")
+        return
+    selected_id = status.account.id
+    await message.answer(
+        "Расписание изменено. Перестроить будущую очередь под новые "
+        "настройки?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔄 Перестроить",
+                callback_data=f"ap:q_rebuild:{selected_id}",
+            )],
+            [InlineKeyboardButton(
+                text="Оставить как есть",
+                callback_data=f"ac:menu:{selected_id}",
+            )],
+        ]),
     )
 
 
@@ -300,7 +330,11 @@ async def cap_value(msg: Message, state: FSMContext):
             {"posts_per_day": posts_per_day, "uid": uid},
         )
         await session.commit()
-    await _answer_status(msg, uid, data["account_id"])
+    await _answer_schedule_changed(
+        msg,
+        uid,
+        data["account_id"],
+    )
 
 
 @router.callback_query(F.data == "ac:topics")
@@ -437,7 +471,11 @@ async def slots_value(msg: Message, state: FSMContext):
             {"slots": serialized, "uid": uid},
         )
         await session.commit()
-    await _answer_status(msg, uid, data["account_id"])
+    await _answer_schedule_changed(
+        msg,
+        uid,
+        data["account_id"],
+    )
 
 
 @router.callback_query(F.data == "ac:days")
@@ -467,7 +505,12 @@ async def cb_days(cb: CallbackQuery):
             {"days": next_value, "uid": uid},
         )
         await session.commit()
-    await _show_schedule(cb, account_id)
+    await _answer_schedule_changed(
+        cb.message,
+        uid,
+        account_id,
+    )
+    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("ac:timezone:"))
@@ -506,7 +549,11 @@ async def timezone_value(msg: Message, state: FSMContext):
             {"timezone": timezone_name, "uid": uid},
         )
         await session.commit()
-    await _answer_status(msg, uid, data["account_id"])
+    await _answer_schedule_changed(
+        msg,
+        uid,
+        data["account_id"],
+    )
 
 
 GOAL_CYCLE = [

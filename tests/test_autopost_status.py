@@ -236,6 +236,7 @@ def test_menu_has_required_enabled_and_disabled_controls():
         for button in row
     ]
     assert "⏸ Остановить" in enabled_labels
+    assert "📋 Очередь" in enabled_labels
     assert "📋 История" in enabled_labels
     assert "🔄 Обновить статус" in enabled_labels
     assert "▶️ Включить автопостинг" in disabled_labels
@@ -373,7 +374,7 @@ def test_run_reservation_is_database_idempotent():
     assert first == 51
     assert second is None
     sql = session.calls[0][0]
-    assert "ON CONFLICT (threads_account_id, scheduled_at)" in sql
+    assert "ON CONFLICT DO NOTHING" in sql
     assert "DO NOTHING" in sql
     assert "AND active" in sql
 
@@ -486,7 +487,11 @@ def test_threads_error_stores_safe_result_only(monkeypatch):
     session = QueueSession([
         [("publishing",)],
         [(0,)],
-        [("threads-user", b"encrypted", NOW + timedelta(days=1))],
+        [(
+            "threads-user",
+            b"encrypted",
+            datetime(2099, 1, 1, tzinfo=timezone.utc),
+        )],
         [],
         [],
     ])
@@ -592,6 +597,7 @@ def test_insufficient_credits_records_skipped_run(monkeypatch):
         ["automation"],
         11,
         account_expires_at=NOW + timedelta(days=30),
+        max_generations=1,
     ))
     assert result == 0
     finish = next(
@@ -658,9 +664,14 @@ def test_generation_and_quality_failures_are_recorded(
 def test_successful_generation_attaches_post_to_run(monkeypatch):
     session = PlannerSession(planner_slot_text())
     configure_planner(monkeypatch, session)
+    spend_calls = []
 
     async def spend(*_args, **_kwargs):
+        spend_calls.append((_args, _kwargs))
         return 10
+
+    async def forbidden_topup(*_args, **_kwargs):
+        raise AssertionError("successful generation must not refund")
 
     async def generate(*_args, **_kwargs):
         return {
@@ -671,6 +682,7 @@ def test_successful_generation_attaches_post_to_run(monkeypatch):
         }
 
     monkeypatch.setattr(autocontent.credits, "spend", spend)
+    monkeypatch.setattr(autocontent.credits, "topup", forbidden_topup)
     monkeypatch.setattr(
         autocontent.scenarist,
         "generate_post",
@@ -683,14 +695,17 @@ def test_successful_generation_attaches_post_to_run(monkeypatch):
         ["automation"],
         11,
         account_expires_at=NOW + timedelta(days=30),
+        max_generations=1,
     ))
     assert result == 1
+    assert len(spend_calls) == 1
     insert = next(
         params
         for sql, params in session.calls
         if "INSERT INTO scheduled_posts" in sql
     )
     assert insert["run_id"] == 51
+    assert '"source":"autocontent"' in insert["metadata"]
     attach = next(
         params
         for sql, params in session.calls

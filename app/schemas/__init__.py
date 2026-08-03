@@ -3,6 +3,11 @@
 from app.schemas.autopost import (
     AutopostAccount,
     AutopostErrorCode,
+    AutopostQueueClearResult,
+    AutopostQueueDay,
+    AutopostQueueItem,
+    AutopostQueueRebuildResult,
+    AutopostQueueSummary,
     AutopostRun,
     AutopostRunStatus,
     AutopostSettings,
@@ -48,6 +53,11 @@ from app.schemas.social_brain import (
 __all__ = [
     "AutopostAccount",
     "AutopostErrorCode",
+    "AutopostQueueClearResult",
+    "AutopostQueueDay",
+    "AutopostQueueItem",
+    "AutopostQueueRebuildResult",
+    "AutopostQueueSummary",
     "AutopostRun",
     "AutopostRunStatus",
     "AutopostSettings",

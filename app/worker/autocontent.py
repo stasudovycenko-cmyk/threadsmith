@@ -1,10 +1,10 @@
 """
 Авто-контент для Автопилота. Джоба крутится раз в пять минут.
 
-Для каждого юзера, у кого включён авто-контент (autocontent_settings.active):
-  1. Смотрим, сколько постов уже стоит в очереди на сегодня.
-  2. Если меньше плана (posts_per_day) — генерим недостающие Сценаристом
-     его голосом по его нише и ставим в scheduled_posts на точные slots.
+Для каждого аккаунта с включённым авто-контентом:
+  1. Смотрим будущую auto-очередь в общем planning horizon.
+  2. Генерируем Сценаристом до лимита запуска и каждый текст ставим в
+     ближайший свободный account-local slot.
 
 Требует: обученный голос + заданная ниша + подключённый Threads.
 Списывает кредиты как обычная генерация (generate_post). Нет кредитов —
@@ -32,16 +32,17 @@ from app.core.ai_cost import (
 from app.core.autopost_status import (
     AutopostStatusService,
     DEFAULT_TIMEZONE,
+    QUEUE_CLEARED_MESSAGE,
     SAFE_ERROR_MESSAGES,
     ensure_aware,
     normalize_error,
     parse_slots,
-    select_next_slots,
 )
 from app.core.config import CREDIT_COSTS
 from app.core.content_engine import ContentMemoryRepo
 from app.core.db import Session
 from app.core.llm import LLMGuardError
+from app.schemas.autopost import AutopostSettings
 
 log = logging.getLogger("autocontent")
 
@@ -107,6 +108,16 @@ def _bounded_generation_count(
     )
 
 
+def _should_refund_unattached_generation(
+    run_state: tuple[str, str | None] | None,
+) -> bool:
+    return not (
+        run_state
+        and run_state[0] == "skipped"
+        and run_state[1] == QUEUE_CLEARED_MESSAGE
+    )
+
+
 async def _plan_for_user(
     uid,
     per_day,
@@ -163,10 +174,30 @@ async def _plan_for_user(
         ), {"uid": uid, "acc": acc_id})).first()
         total_posts = trow2[0] if trow2 else 0
         pending_row = (await s.execute(text("""
-            SELECT count(*) FROM scheduled_posts
-            WHERE user_id = :uid
-              AND threads_account_id = :acc
-              AND status = 'pending'
+            SELECT count(*)
+            FROM (
+              SELECT post.id
+              FROM scheduled_posts post
+              WHERE post.user_id = :uid
+                AND post.threads_account_id = :acc
+                AND post.status = 'pending'
+                AND post.run_at > now()
+                AND (
+                  post.content_metadata ->> 'source' = 'autocontent'
+                  OR EXISTS (
+                    SELECT 1 FROM autopost_runs linked
+                    WHERE linked.scheduled_post_id = post.id
+                  )
+                )
+              UNION ALL
+              SELECT -run.id
+              FROM autopost_runs run
+              WHERE run.user_id = :uid
+                AND run.threads_account_id = :acc
+                AND run.status = 'pending'
+                AND run.scheduled_post_id IS NULL
+                AND run.scheduled_at > now()
+            ) auto_queue
         """), {"uid": uid, "acc": acc_id})).first()
         pending_count = int(pending_row[0] if pending_row else 0)
         try:
@@ -223,27 +254,19 @@ async def _plan_for_user(
         return 0
 
     kws = keywords or [niche]
-    now = datetime.now(timezone.utc)
-    async with Session() as s:
-        occupied = await AutopostStatusService(s).occupied_slots(
-            uid,
-            acc_id,
-            now=now,
-            timezone_name=timezone_name,
-        )
-    available_times = select_next_slots(
-        now=now,
+    settings = AutopostSettings(
+        enabled=True,
+        posts_per_day=per_day,
         slots=slots,
         days=days,
-        timezone_name=timezone_name,
-        posts_per_day=per_day,
-        occupied=occupied,
+        timezone=timezone_name,
     )
+    pending_capacity = AUTOCONTENT_MAX_PENDING_POSTS - pending_count
     generation_count = _bounded_generation_count(
-        need=len(available_times),
+        need=pending_capacity,
         max_generations=max_generations,
         pending_count=pending_count,
-        available_slots=len(available_times),
+        available_slots=pending_capacity,
     )
     if generation_count <= 0:
         return 0
@@ -258,20 +281,24 @@ async def _plan_for_user(
         ),
     )
     for i in range(generation_count):
-        run_at = available_times[i]
+        reservation_now = datetime.now(timezone.utc)
         async with Session() as s:
-            run_id = await AutopostStatusService(s).reserve_run(
+            reservation = await AutopostStatusService(
+                s
+            ).reserve_next_run(
                 uid,
                 acc_id,
-                run_at,
+                settings=settings,
+                now=reservation_now,
             )
             await s.commit()
-        if run_id is None:
-            continue
+        if reservation is None:
+            return attempts
+        run_id, run_at = reservation
 
         if (
             account_expires_at is not None
-            and ensure_aware(account_expires_at) <= now
+            and ensure_aware(account_expires_at) <= reservation_now
         ):
             async with Session() as s:
                 await AutopostStatusService(s).finish_run(
@@ -283,7 +310,7 @@ async def _plan_for_user(
                     ],
                 )
                 await s.commit()
-            continue
+            return attempts
 
         # тема = ниша + случайный ключевик, для разнообразия
         if topics:
@@ -363,7 +390,7 @@ async def _plan_for_user(
                 acc_id,
                 type(error).__name__,
             )
-            continue
+            return attempts
 
         # собираем пост: выбранный хук + тело
         hooks = out.get("hooks", [])
@@ -374,9 +401,12 @@ async def _plan_for_user(
         )
         body = out.get("body", "")
         post_text = scenarist.trim_post(hook + chr(10) + chr(10) + body)
-        metadata = out.get("metadata") or {}
+        metadata = dict(out.get("metadata") or {})
+        metadata["source"] = "autocontent"
 
         async with Session() as s:
+            service = AutopostStatusService(s)
+            await service.lock_queue(uid, acc_id)
             row = (await s.execute(text("""
                 INSERT INTO scheduled_posts
                     (user_id, threads_account_id, text, run_at, status,
@@ -403,15 +433,27 @@ async def _plan_for_user(
                 ),
             })).first()
             if row is None:
-                await credits.topup(
-                    s,
-                    uid,
-                    cost,
-                    "refund_autocontent_disabled",
-                )
+                run_state = (
+                    await s.execute(
+                        text("""
+                            SELECT status, safe_error_message
+                            FROM autopost_runs
+                            WHERE id = :run_id
+                            FOR UPDATE
+                        """),
+                        {"run_id": run_id},
+                    )
+                ).first()
+                if _should_refund_unattached_generation(run_state):
+                    await credits.topup(
+                        s,
+                        uid,
+                        cost,
+                        "refund_autocontent_disabled",
+                    )
                 await s.commit()
-                continue
-            await AutopostStatusService(s).attach_post(
+                return attempts
+            await service.attach_post(
                 run_id,
                 row[0],
             )
