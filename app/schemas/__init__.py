@@ -10,6 +10,18 @@ from app.schemas.accounts import (
     SelectedThreadsAccount,
     ThreadsAccount,
 )
+from app.schemas.analytics import (
+    AnalyticsAccountSummary,
+    AnalyticsBaseline,
+    AnalyticsCollectionResult,
+    AnalyticsFeatureBenchmarks,
+    AnalyticsMetrics,
+    AnalyticsScores,
+    AnalyticsSnapshotWrite,
+    PreviousAnalyticsSnapshot,
+    ProviderAnalyticsPost,
+    PublishedAnalyticsPost,
+)
 
 from app.schemas.autopost import (
     AutopostAccount,
@@ -70,6 +82,16 @@ __all__ = [
     "OAuthState",
     "SelectedThreadsAccount",
     "ThreadsAccount",
+    "AnalyticsAccountSummary",
+    "AnalyticsBaseline",
+    "AnalyticsCollectionResult",
+    "AnalyticsFeatureBenchmarks",
+    "AnalyticsMetrics",
+    "AnalyticsScores",
+    "AnalyticsSnapshotWrite",
+    "PreviousAnalyticsSnapshot",
+    "ProviderAnalyticsPost",
+    "PublishedAnalyticsPost",
     "AutopostAccount",
     "AutopostErrorCode",
     "AutopostQueueClearResult",

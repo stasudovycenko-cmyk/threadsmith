@@ -319,3 +319,26 @@ async def get_insights(token: str, post_id: str) -> dict:
                 continue
             metrics[name] = values[0]["value"]
         return metrics
+
+
+async def get_own_threads(token: str, *, limit: int = 50) -> list[dict]:
+    """Return the connected account's latest own Threads publications."""
+    safe_limit = max(1, min(int(limit), 50))
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{BASE}/v1.0/me/threads",
+                params={
+                    "fields": "id,text,timestamp,permalink",
+                    "limit": safe_limit,
+                    "access_token": token,
+                },
+            )
+    except httpx.HTTPError as error:
+        raise ThreadsAPIError(
+            "Threads API own-post listing transport error: "
+            f"{type(error).__name__}"
+        ) from error
+    _raise_for_status_safe(response)
+    data = response.json().get("data", [])
+    return data if isinstance(data, list) else []

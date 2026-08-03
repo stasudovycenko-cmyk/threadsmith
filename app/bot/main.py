@@ -4,6 +4,7 @@ import logging
 from aiogram import Bot, Dispatcher
 
 from app.bot.handlers.admin import router as admin_router
+from app.bot.handlers.analytics import router as analytics_router
 from app.bot.handlers.nav import router as nav_router
 from app.bot.handlers.docs import router as docs_router
 from app.bot.handlers.autocontent_ui import router as autocontent_router
@@ -32,6 +33,7 @@ async def main():
 
     dp.include_router(start_router)
     dp.include_router(cabinet_router)
+    dp.include_router(analytics_router)
     dp.include_router(scenarist_router)
     dp.include_router(autopilot_router)
     dp.include_router(autocontent_router)

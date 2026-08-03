@@ -339,6 +339,37 @@ class BrainWriter:
             occurred_at=occurred_at,
         )
 
+    async def record_post_performance_updated(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        analytics_snapshot_id: int,
+        threads_post_id: str,
+        snapshot_at: datetime,
+        scores: dict[str, float],
+        available_metrics: list[str],
+    ) -> int | None:
+        """Append the Analytics V2 event without exposing raw credentials."""
+        brain = await self.repo.get_or_create(user_id, account_id)
+        return await self.record_event(
+            brain.id,
+            "POST_PERFORMANCE_UPDATED",
+            payload={
+                "threads_post_id": threads_post_id,
+                "snapshot_at": snapshot_at.isoformat(),
+                "scores": scores,
+                "available_metrics": sorted(available_metrics),
+            },
+            source_type="analytics_snapshot",
+            source_id=analytics_snapshot_id,
+            event_key=(
+                "post_performance_updated:analytics_snapshot:"
+                f"{analytics_snapshot_id}"
+            ),
+            occurred_at=snapshot_at,
+        )
+
     async def _load_backfill_sources(
         self,
         user_id: int,
