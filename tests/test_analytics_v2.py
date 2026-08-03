@@ -401,16 +401,19 @@ def test_rebuild_creates_hook_topic_cta_and_publish_time_aggregates():
 
 def test_telegram_rendering_and_empty_state():
     overview = render_overview("creator", make_summary().model_dump())
-    assert "Аналитика @creator" in overview
-    assert "ER: 12.00%" in overview
-    assert "Лучший Hook: question" in overview
+    assert "Аккаунт: @creator" in overview
+    assert "Средний ER: 12%" in overview
+    assert "Лучшее начало: question" in overview
     assert render_dimension("Темы", []) == EMPTY
     callbacks = {
         button.callback_data
         for row in analytics_kb().inline_keyboard
         for button in row
     }
-    assert {"an:top", "an:time", "an:brain", "an:growth"} <= callbacks
+    assert "an:growth" in callbacks
+    assert any(value.startswith("an:top:") for value in callbacks)
+    assert any(value.startswith("an:time:") for value in callbacks)
+    assert any(value.startswith("an:brain:") for value in callbacks)
 
 
 def test_scheduler_runs_analytics_every_thirty_minutes(monkeypatch):

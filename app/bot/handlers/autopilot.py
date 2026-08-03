@@ -1,14 +1,9 @@
-"""
-Модуль 3 в боте: поставить пост в календарь, глянуть очередь,
-настроить правила автоответов.
-
-Время: юзер вводит "ДД.ММ ЧЧ:ММ" по Москве. На MVP таймзона захардкожена
-МСК - ЦА русскоязычная. Поле tz у юзера - в бэклог.
-"""
+"""Manual scheduling, queue controls, and reply-rule Telegram UI."""
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
@@ -28,8 +23,17 @@ from app.core.db import Session
 log = logging.getLogger("autopilot_bot")
 router = Router()
 
-MSK = timezone(timedelta(hours=3))
 
+def render_clear_confirmation(summary) -> str:
+    account_name = f"@{summary.account.username or summary.account.id}"
+    return (
+        "⚠️ Очистить очередь Автопилота?\n\n"
+        f"Аккаунт: {account_name}\n"
+        f"Будет удалено постов: {len(summary.posts)}\n\n"
+        "Потраченные на генерацию кредиты не возвращаются.\n\n"
+        "Опубликованные посты и история останутся. Другие аккаунты "
+        "не будут затронуты."
+    )
 
 class Schedule(StatesGroup):
     body = State()
@@ -47,7 +51,7 @@ def ap_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 Запланировать пост", callback_data="ap:new")],
         [InlineKeyboardButton(text="📋 Очередь", callback_data="ap:queue"),
          InlineKeyboardButton(text="🤖 Автоответы", callback_data="ap:rules")],
-        [InlineKeyboardButton(text="✨ Автопостинг", callback_data="ac:menu")],
+        [InlineKeyboardButton(text="✨ Автопилот", callback_data="ac:menu")],
         [InlineKeyboardButton(text="🏠 Главная", callback_data="home")],
     ])
 
@@ -75,26 +79,47 @@ async def cb_menu(cb: CallbackQuery):
 async def cb_new(cb: CallbackQuery, state: FSMContext):
     uid, acc = await _uid_and_acc(cb.from_user.id)
     if not acc:
-        await cb.message.answer("Сначала подключи Threads: /start -> Подключить Threads")
+        await cb.message.answer("Сначала подключите Threads-аккаунт.")
         await cb.answer()
         return
+    async with Session() as session:
+        timezone_name = (await session.execute(text("""
+            SELECT timezone FROM autocontent_settings
+            WHERE user_id = :uid AND threads_account_id = :account_id
+        """), {"uid": uid, "account_id": acc})).scalar_one_or_none()
     await state.set_state(Schedule.body)
-    await state.update_data(account_id=acc)
-    await cb.message.answer("Текст поста (до 500 символов):")
+    await state.update_data(
+        account_id=acc,
+        timezone=timezone_name or "Europe/Moscow",
+    )
+    await cb.message.answer(
+        "Введите текст поста до 500 символов.\nДля отмены: /cancel"
+    )
     await cb.answer()
+
+
+@router.message(Schedule.body, Command("cancel"))
+@router.message(Schedule.link, Command("cancel"))
+@router.message(Schedule.when, Command("cancel"))
+async def cancel_schedule(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Планирование отменено. Пост не добавлен в очередь.")
 
 
 @router.message(Schedule.body)
 async def sch_body(msg: Message, state: FSMContext):
     body = (msg.text or "").strip()
     if len(body) > 500:
-        await msg.answer(f"Длина {len(body)}, лимит Threads 500. Режь.")
+        await msg.answer(
+            f"Длина: {len(body)} символов. Лимит Threads: 500. "
+            "Сократите текст."
+        )
         return
     await state.update_data(body=body)
     await state.set_state(Schedule.link)
     await msg.answer(
-        "Ссылка? Уйдёт первым комментом с UTM, чтобы не резать охват.\n"
-        "Нет ссылки - шли «-»"
+        "Отправьте ссылку: она будет опубликована первым комментарием.\n"
+        "Если ссылки нет, отправьте «-». Для отмены: /cancel"
     )
 
 
@@ -107,18 +132,29 @@ async def sch_link(msg: Message, state: FSMContext):
         return
     await state.update_data(link=link)
     await state.set_state(Schedule.when)
-    await msg.answer("Когда постить? Формат: ДД.ММ ЧЧ:ММ (по Москве). Или «сейчас»")
+    data = await state.get_data()
+    await msg.answer(
+        "Когда опубликовать? Формат: ДД.ММ ЧЧ:ММ.\n"
+        f"Часовой пояс: {data.get('timezone', 'Europe/Moscow')}.\n"
+        "Также можно написать «сейчас». Для отмены: /cancel"
+    )
 
 
 @router.message(Schedule.when)
 async def sch_when(msg: Message, state: FSMContext):
     raw = (msg.text or "").strip().lower()
-    now = datetime.now(MSK)
+    state_data = await state.get_data()
+    timezone_name = state_data.get("timezone") or "Europe/Moscow"
+    local_timezone = resolve_timezone(timezone_name)
+    now = datetime.now(local_timezone)
     if raw in ("сейчас", "now"):
         run_at = now
     else:
         try:
-            dt = datetime.strptime(raw, "%d.%m %H:%M").replace(year=now.year, tzinfo=MSK)
+            dt = datetime.strptime(raw, "%d.%m %H:%M").replace(
+                year=now.year,
+                tzinfo=local_timezone,
+            )
             if dt < now - timedelta(minutes=5):
                 dt = dt.replace(year=now.year + 1)  # 05.01 в декабре = январь следующего
             run_at = dt
@@ -126,10 +162,15 @@ async def sch_when(msg: Message, state: FSMContext):
             await msg.answer("Не понял. Формат: 15.07 09:30. Или «сейчас»")
             return
 
-    data = await state.get_data()
+    data = state_data
     await state.clear()
-    uid, _ = await _uid_and_acc(msg.from_user.id)
+    uid, selected_account_id = await _uid_and_acc(msg.from_user.id)
     acc = data.get("account_id")
+    if selected_account_id != acc:
+        await msg.answer(
+            "Активный аккаунт изменился. Откройте планирование заново."
+        )
+        return
     async with Session() as ownership_session:
         owned = await ThreadsAccountService(
             ownership_session
@@ -147,7 +188,7 @@ async def sch_when(msg: Message, state: FSMContext):
         await s.commit()
 
     when_str = "прямо сейчас (в ближайшую минуту)" if raw in ("сейчас", "now") \
-        else run_at.strftime("%d.%m %H:%M мск")
+        else run_at.strftime("%d.%m %H:%M") + f" ({timezone_name})"
     await msg.answer(f"В очереди. Публикация: {when_str}", reply_markup=ap_kb())
 
 
@@ -269,19 +310,23 @@ async def cb_queue_rebuild(cb: CallbackQuery):
 @router.callback_query(F.data.startswith("ap:q_clear:"))
 async def cb_queue_clear_confirm(cb: CallbackQuery):
     account_id = int(cb.data.rsplit(":", 1)[1])
+    uid, _ = await _uid_and_acc(cb.from_user.id)
+    async with Session() as session:
+        summary = await AutopostStatusService(session).queue_summary(
+            uid, account_id
+        )
+    if summary is None:
+        await cb.answer("Аккаунт не найден", show_alert=True)
+        return
     await cb.message.answer(
-        "⚠️ Очистить очередь автопостинга?\n\n"
-        "Будут удалены все будущие неопубликованные посты этого "
-        "Threads-аккаунта.\n\n"
-        "Потраченные на генерацию кредиты не возвращаются.\n\n"
-        "Опубликованные посты и история запусков останутся.",
+        render_clear_confirmation(summary),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
                 text="🗑 Очистить и оставить включённым",
                 callback_data=f"ap:q_clear_keep:{account_id}",
             )],
             [InlineKeyboardButton(
-                text="⏸ Очистить и выключить автопостинг",
+                text="⏸ Очистить и выключить Автопилот",
                 callback_data=f"ap:q_clear_disable:{account_id}",
             )],
             [InlineKeyboardButton(
@@ -377,7 +422,10 @@ async def cb_del(cb: CallbackQuery):
             "removable": bool(removable),
         })).first()
         await s.commit()
-    await cb.answer("Снял" if row else "Уже публикуется, поздно", show_alert=not row)
+    await cb.answer(
+        "Пост снят с очереди" if row else "Пост уже публикуется",
+        show_alert=not row,
+    )
 
 
 # ---------- правила автоответов ----------
@@ -475,6 +523,7 @@ async def cb_view(cb: CallbackQuery):
             FROM scheduled_posts post
             LEFT JOIN autocontent_settings ac
               ON ac.user_id = post.user_id
+             AND ac.threads_account_id = post.threads_account_id
             WHERE post.id = :pid
               AND post.user_id = :uid
               AND post.threads_account_id = :account_id
@@ -484,7 +533,7 @@ async def cb_view(cb: CallbackQuery):
             "account_id": account_id,
         })).first()
     if not row:
-        await cb.answer("Не нашёл", show_alert=True)
+        await cb.answer("Пост не найден", show_alert=True)
         return
     body, run_at, status, timezone_name = row
     when = run_at.astimezone(
@@ -501,7 +550,16 @@ async def cb_view(cb: CallbackQuery):
             callback_data=f"ap:queue:{account_id}",
         )],
     ])
-    head = "Пост на " + when + " · " + status + " · " + str(len(body)) + " симв."
+    status_label = {
+        "pending": "Ожидает",
+        "publishing": "Публикуется",
+        "done": "Опубликован",
+        "failed": "Ошибка",
+    }.get(status, "Статус обновлён")
+    head = (
+        "Пост на " + when + " · " + status_label + " · "
+        + str(len(body)) + " симв."
+    )
     await cb.message.answer(head + chr(10) + chr(10) + body, reply_markup=kb)
     await cb.answer()
 

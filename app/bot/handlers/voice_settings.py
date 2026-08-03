@@ -1,7 +1,6 @@
-"""
-Глубокая настройка голоса: ручные крутилки поверх обученного профиля.
-"""
+"""Глубокая ручная настройка поверх обученного профиля голоса."""
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
@@ -66,9 +65,12 @@ def _kb(st):
 async def _show(target, uid):
     st = await _settings(uid)
     await target.answer(
-        "🎙 Настройка голоса. Крутилки перекрывают обученный профиль.\n\n"
+        "🎙 Настройка голоса\n\n"
+        "Эти параметры уточняют обученный профиль и применяются ко всем "
+        "вашим аккаунтам.\n\n"
         f"Доп. инструкции: {st.get('extra') or '—'}\n\n"
-        "Тыкай кнопки — значение меняется по кругу. Пусто = не влияет.",
+        "Нажимайте кнопки, чтобы выбрать значение. «Не задано» означает, "
+        "что параметр не влияет на текст.",
         reply_markup=_kb(st))
 
 
@@ -103,10 +105,16 @@ async def cb_cyc(cb: CallbackQuery):
 async def cb_extra(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Extra.value)
     await cb.message.answer(
-        "Впиши одним сообщением: чего избегать, фирменная подпись, для кого пишем.\n\n"
+        "Напишите одним сообщением: чего избегать, фирменную подпись и для кого пишем.\n\n"
         "Пример: без канцелярита, подпись «Стас на связи», аудитория — новички в заработке.\n\n"
-        "Или «-» чтобы очистить.")
+        "Или «-» чтобы очистить. Для отмены: /cancel.")
     await cb.answer()
+
+
+@router.message(Extra.value, Command("cancel"))
+async def cancel_extra(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Ввод отменён. Настройки не изменены.")
 
 
 @router.message(Extra.value)
@@ -121,5 +129,5 @@ async def extra_value(msg: Message, state: FSMContext):
             "UPDATE voice_settings SET extra=:v, updated_at=now() "
             "WHERE user_id=:uid"), {"v": val, "uid": uid})
         await s.commit()
-    await msg.answer("Сохранил." if val else "Очистил.")
+    await msg.answer("Сохранено." if val else "Очищено.")
     await _show(msg, uid)

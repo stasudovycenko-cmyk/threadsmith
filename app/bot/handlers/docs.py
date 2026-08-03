@@ -48,9 +48,9 @@ def kb(lang="ru"):
     other = ("🇬🇧 English", "docs:en") if lang == "ru" else ("🇷🇺 Русский", "docs:ru")
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=other[0], callback_data=other[1])],
-        [InlineKeyboardButton(text="Privacy Policy", url=BASE + "/privacy")],
-        [InlineKeyboardButton(text="Terms of Service", url=BASE + "/terms")],
-        [InlineKeyboardButton(text="Data Deletion", url=BASE + "/data-deletion")],
+        [InlineKeyboardButton(text="Политика конфиденциальности", url=BASE + "/privacy")],
+        [InlineKeyboardButton(text="Условия использования", url=BASE + "/terms")],
+        [InlineKeyboardButton(text="Удаление данных", url=BASE + "/data-deletion")],
         [InlineKeyboardButton(text="🏠 Главная", callback_data="home")],
     ])
 

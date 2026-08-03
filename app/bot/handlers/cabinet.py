@@ -20,7 +20,6 @@ from app.core.accounts import (
     authorization_label,
     authorization_status,
     ensure_aware,
-    safe_threads_id,
 )
 from app.core.autopost_status import (
     AutopostStatusService,
@@ -52,6 +51,17 @@ def _account_name(account) -> str:
     return f"@{account.username or account.id}"
 
 
+def render_delete_confirmation(account) -> str:
+    return (
+        f"⚠️ Удалить данные {_account_name(account)}?\n\n"
+        "Удаляются: токен, настройки, очередь, Social Brain, Analytics и "
+        "история публикаций этого аккаунта.\n\n"
+        "Сохраняются: тариф, кредиты пользователя и другие "
+        "Threads-аккаунты.\n\n"
+        "Потраченные кредиты не возвращаются. Действие необратимо."
+    )
+
+
 def _connect_keyboard(state: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(
@@ -71,7 +81,7 @@ async def _start_oauth(
         service = ThreadsAccountService(session)
         user_id = await service.user_id_for_telegram(cb.from_user.id)
         if user_id is None:
-            await cb.answer("Сначала нажми /start", show_alert=True)
+            await cb.answer("Сначала нажмите /start", show_alert=True)
             return
         try:
             oauth = await service.create_oauth_state(
@@ -89,7 +99,7 @@ async def _start_oauth(
         else "Подключение нового Threads-аккаунта."
     )
     await cb.message.answer(
-        title + " Авторизуй нужный аккаунт и подтверди доступ.",
+        title + " Авторизуйте нужный аккаунт и подтвердите доступ.",
         reply_markup=_connect_keyboard(oauth.state),
     )
     await cb.answer()
@@ -101,7 +111,7 @@ async def cb_cabinet(cb: CallbackQuery):
         service = ThreadsAccountService(session)
         user_id = await service.user_id_for_telegram(cb.from_user.id)
         if user_id is None:
-            await cb.answer("Сначала нажми /start", show_alert=True)
+            await cb.answer("Сначала нажмите /start", show_alert=True)
             return
         row = (
             await session.execute(
@@ -124,7 +134,7 @@ async def cb_cabinet(cb: CallbackQuery):
     plan_title = PLANS.get(plan_code, PLANS["free"])["title"]
     username = cb.from_user.username
     lines = [
-        "👤 ЛИЧНЫЙ КАБИНЕТ",
+        "👤 Аккаунт и тариф",
         "",
         f"Telegram: @{username}" if username else (
             f"Telegram ID: {cb.from_user.id}"
@@ -174,7 +184,7 @@ async def cb_accounts(cb: CallbackQuery):
             cb.from_user.id
         )
         if user_id is None:
-            await cb.answer("Сначала нажми /start", show_alert=True)
+            await cb.answer("Сначала нажмите /start", show_alert=True)
             return
         accounts = await account_service.list_accounts(user_id)
         selected = await account_service.selected_account(user_id)
@@ -182,27 +192,67 @@ async def cb_accounts(cb: CallbackQuery):
         summaries = []
         for account in accounts:
             status = await status_service.get_status(user_id, account.id)
-            summaries.append((account, status))
+            extra = (await session.execute(text("""
+                SELECT
+                  coalesce((SELECT cardinality(keywords) > 0 FROM radar_settings
+                            WHERE user_id = :user_id
+                              AND threads_account_id = :account_id), false),
+                  coalesce((SELECT active FROM neuro_settings
+                            WHERE user_id = :user_id
+                              AND threads_account_id = :account_id), false),
+                  (SELECT posts_total FROM analytics_account_summary
+                   WHERE user_id = :user_id
+                     AND threads_account_id = :account_id),
+                  (SELECT avg_er FROM analytics_account_summary
+                   WHERE user_id = :user_id
+                     AND threads_account_id = :account_id),
+                  (SELECT updated_at FROM analytics_account_summary
+                   WHERE user_id = :user_id
+                     AND threads_account_id = :account_id)
+            """), {
+                "user_id": user_id,
+                "account_id": account.id,
+            })).first()
+            summaries.append((account, status, extra))
         await session.commit()
-    lines = ["🔗 МОИ THREADS-АККАУНТЫ", ""]
+    lines = ["🔗 Threads-аккаунты", ""]
     buttons = []
     if not accounts:
         lines.extend([
             "Threads-аккаунт не подключён.",
             "",
-            "Подключи аккаунт, чтобы использовать публикацию и аналитику.",
+            "Подключите аккаунт, чтобы использовать публикацию и аналитику.",
         ])
-    for account, status in summaries:
+    for account, status, extra in summaries:
         marker = "✅ " if selected and selected.id == account.id else ""
         if authorization_status(account) in {"EXPIRED", "ERROR"}:
             marker = "⚠️ "
         lines.extend([
             f"{marker}{_account_name(account)}",
-            "Автопостинг: " + (
+            "Автопилот: " + (
                 "включён" if account.autoposting_enabled else "выключен"
             ),
+            "Radar: " + ("готов" if extra and extra[0] else "не настроен"),
+            "Neuro: " + ("включён" if extra and extra[1] else "выключен"),
             authorization_label(account),
         ])
+        if extra and extra[2]:
+            lines.append(
+                f"Аналитика: {extra[2]} постов · ER "
+                f"{float(extra[3]) * 100:.1f}%".replace(".", ",")
+                if extra[3] is not None
+                else f"Аналитика: {extra[2]} постов"
+            )
+        if extra and extra[4]:
+            timezone_name = (
+                status.settings.timezone if status else "Europe/Moscow"
+            )
+            lines.append(
+                "Последняя синхронизация: "
+                + format_local_datetime(
+                    extra[4], timezone_name
+                ).lower()
+            )
         if status and status.next_run_at:
             lines.append(
                 "Следующий пост: "
@@ -252,6 +302,24 @@ async def cb_account(cb: CallbackQuery):
             user_id,
             account_id,
         )
+        extra = (await session.execute(text("""
+            SELECT
+              coalesce((SELECT cardinality(keywords) > 0 FROM radar_settings
+                        WHERE user_id = :user_id
+                          AND threads_account_id = :account_id), false),
+              coalesce((SELECT active FROM neuro_settings
+                        WHERE user_id = :user_id
+                          AND threads_account_id = :account_id), false),
+              (SELECT posts_total FROM analytics_account_summary
+               WHERE user_id = :user_id
+                 AND threads_account_id = :account_id),
+              (SELECT updated_at FROM analytics_account_summary
+               WHERE user_id = :user_id
+                 AND threads_account_id = :account_id),
+              (SELECT status FROM ux_onboarding
+               WHERE user_id = :user_id
+                 AND threads_account_id = :account_id)
+        """), {"user_id": user_id, "account_id": account_id})).first()
     current = datetime.now(timezone.utc)
     auth_state = authorization_status(account, now=current)
     remaining_days = max(
@@ -259,10 +327,9 @@ async def cb_account(cb: CallbackQuery):
         (ensure_aware(account.expires_at) - current).days,
     )
     lines = [
-        "🔗 THREADS-АККАУНТ",
+        "🔗 Threads-аккаунт",
         "",
         f"Аккаунт: {_account_name(account)}",
-        f"Threads ID: {safe_threads_id(account.threads_user_id)}",
         "Статус: " + (
             "✅ Подключён"
             if account.connection_status == "connected"
@@ -274,7 +341,7 @@ async def cb_account(cb: CallbackQuery):
     ]
     if status:
         lines.extend([
-            "Автопостинг: " + (
+            "Автопилот: " + (
                 "🟢 включён" if status.settings.enabled else "⚪ выключен"
             ),
             f"Постов в день: {status.settings.posts_per_day}",
@@ -297,6 +364,21 @@ async def cb_account(cb: CallbackQuery):
                 else "нет"
             ),
         ])
+    lines.extend([
+        "Radar: " + ("готов" if extra and extra[0] else "не настроен"),
+        "Neuro: " + ("включён" if extra and extra[1] else "выключен"),
+        "Аналитика: " + (
+            f"{extra[2]} постов" if extra and extra[2] else "пока недостаточно данных"
+        ),
+    ])
+    if extra and extra[3]:
+        timezone_name = (
+            status.settings.timezone if status else "Europe/Moscow"
+        )
+        lines.append(
+            "Последняя синхронизация: "
+            + format_local_datetime(extra[3], timezone_name).lower()
+        )
     buttons = []
     if account.selected:
         buttons.append([InlineKeyboardButton(
@@ -311,22 +393,30 @@ async def cb_account(cb: CallbackQuery):
     if account.connection_status == "connected":
         buttons.extend([
             [InlineKeyboardButton(
-                text="🚀 Автопилот",
-                callback_data=f"cab:autopilot:{account.id}",
+                text="🏠 Открыть главный экран",
+                callback_data=f"cab:dashboard:{account.id}",
             )],
-            [InlineKeyboardButton(
-                text="📋 Очередь",
-                callback_data=f"ap:queue:{account.id}",
-            )],
-            [InlineKeyboardButton(
-                text=(
-                    "⏸ Остановить автопостинг"
-                    if account.autoposting_enabled
-                    else "▶️ Включить автопостинг"
+            [
+                InlineKeyboardButton(
+                    text="✍️ Автопилот",
+                    callback_data=f"cab:autopilot:{account.id}",
                 ),
-                callback_data=f"ac:toggle:{account.id}",
-            )],
+                InlineKeyboardButton(
+                    text="📋 Очередь",
+                    callback_data=f"ap:queue:{account.id}",
+                ),
+            ],
         ])
+        if not extra or extra[4] not in {"completed", "in_progress"}:
+            buttons.append([InlineKeyboardButton(
+                text="🚀 Настроить аккаунт",
+                callback_data=f"ob:start:{account.id}",
+            )])
+        elif extra[4] == "in_progress":
+            buttons.append([InlineKeyboardButton(
+                text="▶️ Продолжить настройку",
+                callback_data=f"ob:resume:{account.id}",
+            )])
     if auth_state != "CONNECTED" or account.connection_status == "connected":
         buttons.append([InlineKeyboardButton(
             text="🔄 Переподключить",
@@ -399,6 +489,30 @@ async def cb_open_autopilot(cb: CallbackQuery):
     await cb.answer()
 
 
+@router.callback_query(F.data.startswith("cab:dashboard:"))
+async def cb_open_dashboard(cb: CallbackQuery):
+    account_id = _callback_account_id(cb.data)
+    async with Session() as session:
+        service = ThreadsAccountService(session)
+        user_id = await service.user_id_for_telegram(cb.from_user.id)
+        account = (
+            await service.select_account(user_id, account_id)
+            if user_id is not None and account_id is not None
+            else None
+        )
+        if account is None:
+            await cb.answer("Аккаунт не найден", show_alert=True)
+            return
+        await session.commit()
+    await cb.message.answer(
+        f"Активный аккаунт: {_account_name(account)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🏠 Открыть главный экран", callback_data="home")
+        ]]),
+    )
+    await cb.answer("Аккаунт выбран")
+
+
 @router.callback_query(F.data == "cab:connect")
 async def cb_connect(cb: CallbackQuery):
     await _start_oauth(cb, action="connect")
@@ -429,8 +543,8 @@ async def cb_disconnect_confirm(cb: CallbackQuery):
         return
     await cb.message.answer(
         f"⚠️ Отключить {_account_name(account)}?\n\n"
-        "Будет остановлен автопостинг этого аккаунта.\n\n"
-        "Будут удалены его будущие неопубликованные автопосты.\n\n"
+        "Будет остановлен Автопилот этого аккаунта.\n\n"
+        "Будут удалены его будущие неопубликованные посты.\n\n"
         "Потраченные кредиты не возвращаются.\n\n"
         "Опубликованные посты и история останутся.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -462,7 +576,7 @@ async def cb_disconnect(cb: CallbackQuery):
             return
     lines = [
         f"✅ {_account_name(result.account)} отключён.",
-        f"Удалено будущих автопостов: {result.affected_posts}",
+        f"Удалено будущих постов: {result.affected_posts}",
         "Возвращено кредитов: 0",
     ]
     if result.next_selected:
@@ -500,8 +614,18 @@ async def cb_more(cb: CallbackQuery):
         await cb.answer("Аккаунт не найден", show_alert=True)
         return
     await cb.message.answer(
-        f"Дополнительные действия для {_account_name(account)}",
+        f"⚙️ Действия с {_account_name(account)}\n\n"
+        "Отключение сохраняет историю. Полное удаление стирает "
+        "данные выбранного аккаунта без возможности восстановления.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="📋 Скопировать настройки",
+                callback_data=f"cab:copy_settings:{account.id}",
+            )],
+            [InlineKeyboardButton(
+                text="Отключить аккаунт",
+                callback_data=f"cab:disconnect:{account.id}",
+            )],
             [InlineKeyboardButton(
                 text="🧹 Удалить данные аккаунта",
                 callback_data=f"cab:delete:{account.id}",
@@ -532,11 +656,7 @@ async def cb_delete_confirm(cb: CallbackQuery):
         await cb.answer("Аккаунт не найден", show_alert=True)
         return
     await cb.message.answer(
-        f"⚠️ Удалить данные {_account_name(account)}?\n\n"
-        "Будут удалены токен, настройки, очередь, Social Brain, "
-        "история публикаций и связанные account-scoped данные.\n\n"
-        "Тариф, кредиты и другие Threads-аккаунты останутся.\n\n"
-        "Это действие необратимо.",
+        render_delete_confirmation(account),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
                 text="🧹 Удалить навсегда",
@@ -566,7 +686,7 @@ async def cb_delete(cb: CallbackQuery):
         except AccountBusyError:
             await session.rollback()
             await cb.answer(
-                "Сейчас идёт публикация. Повтори после её завершения.",
+                "Сейчас идёт публикация. Повторите после её завершения.",
                 show_alert=True,
             )
             return
@@ -596,10 +716,19 @@ async def cb_setup_default(cb: CallbackQuery):
         user_id = await service.user_id_for_telegram(cb.from_user.id)
         ok = await service.ensure_settings(user_id, account_id)
         await session.commit()
-    await cb.answer(
-        "Настройки созданы" if ok else "Аккаунт не найден",
-        show_alert=not ok,
+    if not ok:
+        await cb.answer("Аккаунт не найден", show_alert=True)
+        return
+    await cb.message.answer(
+        "Настройки созданы. Теперь пройдите короткий мастер.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🚀 Настроить за 2 минуты",
+                callback_data=f"ob:start:{account_id}",
+            )
+        ]]),
     )
+    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("cab:copy_settings:"))
