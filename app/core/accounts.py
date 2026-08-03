@@ -327,6 +327,19 @@ class ThreadsAccountService:
             """),
             {"account_id": account_id, "user_id": user_id},
         )
+        await self.session.execute(
+            text("""
+                INSERT INTO radar_settings (
+                  threads_account_id, user_id
+                )
+                SELECT account.id, account.user_id
+                FROM threads_accounts account
+                WHERE account.id = :account_id
+                  AND account.user_id = :user_id
+                ON CONFLICT (threads_account_id) DO NOTHING
+            """),
+            {"account_id": account_id, "user_id": user_id},
+        )
         if row:
             return True
         return await self.get_owned(user_id, account_id) is not None

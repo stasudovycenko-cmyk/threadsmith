@@ -120,6 +120,7 @@ AI_FEATURE_DAILY_USD_LIMITS: dict[str, Decimal] = {
     "rewrite": Decimal("15.00"),
     "generate_thread": Decimal("15.00"),
     "radar_analysis": Decimal("10.00"),
+    "radar_semantic_score": Decimal("10.00"),
     "neuro_comment": Decimal("10.00"),
     "unspecified": Decimal("5.00"),
 }
@@ -128,6 +129,7 @@ AI_FEATURE_HOURLY_CALL_LIMITS: dict[str, int] = {
     "autocontent_repair": 100,
     "neuro_comment": 100,
     "radar_analysis": 100,
+    "radar_semantic_score": 100,
 }
 AI_DEFAULT_FEATURE_HOURLY_CALL_LIMIT = 200
 AI_RUN_USD_LIMITS: dict[str, Decimal] = {
@@ -254,7 +256,7 @@ def _feature_enabled(feature: str) -> tuple[bool, str]:
         return False, "autocontent"
     if feature == "neuro_comment" and not settings.AI_NEURO_ENABLED:
         return False, "neuro"
-    if feature == "radar_analysis" and not settings.AI_RADAR_ENABLED:
+    if feature.startswith("radar_") and not settings.AI_RADAR_ENABLED:
         return False, "radar"
     return True, ""
 

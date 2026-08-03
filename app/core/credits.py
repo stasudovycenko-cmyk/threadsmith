@@ -31,6 +31,61 @@ async def spend(session: AsyncSession, user_id: int, cost: int, reason: str) -> 
     return row[0]
 
 
+async def spend_once(
+    session: AsyncSession,
+    user_id: int,
+    account_id: int,
+    cost: int,
+    reason: str,
+    operation_key: str,
+) -> bool:
+    """Charge once per durable operation key in the caller's transaction."""
+    event = (
+        await session.execute(
+            text("""
+                INSERT INTO ai_credit_events (
+                  operation_key, user_id, threads_account_id,
+                  feature, credits
+                )
+                SELECT :operation_key, account.user_id, account.id,
+                       :feature, :credits
+                FROM threads_accounts account
+                WHERE account.id = :account_id
+                  AND account.user_id = :user_id
+                ON CONFLICT (operation_key) DO NOTHING
+                RETURNING operation_key
+            """),
+            {
+                "operation_key": operation_key,
+                "user_id": user_id,
+                "account_id": account_id,
+                "feature": reason,
+                "credits": cost,
+            },
+        )
+    ).first()
+    if event is None:
+        return False
+    try:
+        await spend(session, user_id, cost, reason)
+    except Exception:
+        await session.execute(
+            text("""
+                DELETE FROM ai_credit_events
+                WHERE operation_key = :operation_key
+                  AND user_id = :user_id
+                  AND threads_account_id = :account_id
+            """),
+            {
+                "operation_key": operation_key,
+                "user_id": user_id,
+                "account_id": account_id,
+            },
+        )
+        raise
+    return True
+
+
 async def topup(session: AsyncSession, user_id: int, amount: int, reason: str) -> int:
     row = (await session.execute(text("""
         UPDATE users SET credits_balance = credits_balance + :amount

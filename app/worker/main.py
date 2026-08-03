@@ -16,7 +16,7 @@ from app.worker.autocontent import autocontent_planner
 from app.worker.feedback_jobs import feedback_loop_job
 from app.worker.m1_jobs import insights_snapshotter, library_crawler
 from app.worker.m3_jobs import comment_poller, publisher
-from app.worker.m4_jobs import neuro_hunter
+from app.worker.m4_jobs import neuro_hunter, neuro_reply_poller
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -87,6 +87,7 @@ def build_scheduler() -> AsyncIOScheduler:
     # comment_poller disabled until threads_manage_replies is approved by Meta
     scheduler.add_job(library_crawler, "interval", hours=1)
     scheduler.add_job(neuro_hunter, "interval", minutes=20)
+    scheduler.add_job(neuro_reply_poller, "interval", minutes=30)
     scheduler.add_job(
         autocontent_planner,
         "interval",

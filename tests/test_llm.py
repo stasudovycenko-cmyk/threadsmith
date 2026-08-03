@@ -336,6 +336,7 @@ def test_feature_specific_max_tokens_are_conservative():
         "rewrite": 1000,
         "generate_thread": 2600,
         "radar_analysis": 1200,
+        "radar_semantic_score": 300,
         "neuro_comment": 500,
     }
 

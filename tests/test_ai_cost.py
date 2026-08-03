@@ -507,6 +507,7 @@ def test_postgres_reservation_locks_before_budget_check_and_insert():
         ("autocontent_repair", "AI_AUTOCONTENT_ENABLED"),
         ("neuro_comment", "AI_NEURO_ENABLED"),
         ("radar_analysis", "AI_RADAR_ENABLED"),
+        ("radar_semantic_score", "AI_RADAR_ENABLED"),
     ],
 )
 def test_feature_kill_switches(monkeypatch, feature, setting_name):
