@@ -35,6 +35,12 @@ async def _script(connection, source):
         await connection.execute(source)
 
 
+def _pg_char(value):
+    if isinstance(value, bytes):
+        return value.decode("ascii")
+    return value
+
+
 @asynccontextmanager
 async def _database():
     assert TEST_DSN
@@ -125,14 +131,15 @@ def test_forward_schema_defaults_constraints_and_immediate_rollback():
             assert index_definition.index("final_score") < index_definition.index(
                 "discovered_at"
             )
-            assert await connection.fetchval(
+            delete_action = await connection.fetchval(
                 """
                 select confdeltype
                 from pg_constraint
                 where conrelid = 'neuro_comments'::regclass
                   and conname = 'neuro_comments_radar_candidate_owner_fk'
                 """
-            ) == "a"
+            )
+            assert _pg_char(delete_action) == "a"
 
             await _script(connection, ROLLBACK)
             assert await connection.fetchval(
