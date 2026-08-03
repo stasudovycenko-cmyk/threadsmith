@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import uuid
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -32,6 +34,18 @@ pytestmark = pytest.mark.skipif(
 async def _script(connection, source):
     async with connection.transaction():
         await connection.execute(source)
+
+
+def _json_object(value):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, Mapping):
+        raise AssertionError(
+            f"Expected a PostgreSQL JSON object, got {type(value).__name__}"
+        )
+    return dict(value)
 
 
 @asynccontextmanager
@@ -111,6 +125,15 @@ def test_modes_onboarding_constraints_and_immediate_rollback():
                     second_user,
                 )
 
+            assert await connection.fetchval(
+                """
+                select data_type
+                from information_schema.columns
+                where table_schema=current_schema()
+                  and table_name='ux_onboarding'
+                  and column_name='data'
+                """
+            ) == "jsonb"
             await connection.execute(
                 """
                 insert into ux_onboarding (
@@ -131,7 +154,16 @@ def test_modes_onboarding_constraints_and_immediate_rollback():
             )
             assert progress[0] == "in_progress"
             assert progress[1] == 4
-            assert dict(progress[2]) == {"goal": "reach"}
+            assert _json_object(progress[2]) == {"goal": "reach"}
+            assert await connection.fetchval(
+                """
+                select jsonb_typeof(data)
+                from ux_onboarding
+                where user_id=$1 and threads_account_id=$2
+                """,
+                first_user,
+                first_account,
+            ) == "object"
             with pytest.raises(asyncpg.ForeignKeyViolationError):
                 await connection.execute(
                     """
