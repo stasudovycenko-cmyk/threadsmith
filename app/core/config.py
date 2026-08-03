@@ -66,4 +66,7 @@ CREDIT_COSTS = {
     "razbor": 3,
     "voice_onboarding": 0,   # онбординг голоса бесплатный - это активация
     "radar_search": 8,
+    "radar_semantic_score": 1,
+    "neuro_comment": 2,
+    "neuro_variant": 2,
 }

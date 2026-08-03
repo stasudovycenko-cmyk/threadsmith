@@ -22,7 +22,11 @@ from app.core.config import settings
 AUTH_URL = "https://threads.net/oauth/authorize"
 BASE = "https://graph.threads.net"
 
-SCOPES = "threads_basic,threads_content_publish,threads_manage_insights,threads_manage_replies,threads_keyword_search"
+SCOPES = (
+    "threads_basic,threads_content_publish,threads_manage_insights,"
+    "threads_read_replies,threads_manage_replies,"
+    "threads_profile_discovery,threads_keyword_search"
+)
 _SENSITIVE_RESPONSE_RE = re.compile(
     r"(?i)(access_token|refresh_token|client_secret|app_secret|bot_token)"
     r"([\"'\s:=]+)([^,\"'\s&}]+)"
@@ -40,6 +44,14 @@ class ThreadsAPIError(RuntimeError):
     ):
         super().__init__(message)
         self.status_code = status_code
+
+
+class ThreadsPublishUnknownError(ThreadsAPIError):
+    """The publish request may have reached Threads; automatic retry is unsafe."""
+
+
+def is_permission_error(error: BaseException) -> bool:
+    return isinstance(error, ThreadsAPIError) and error.status_code in (401, 403)
 
 
 def _safe_response_error(response: httpx.Response) -> ThreadsAPIError:
@@ -179,32 +191,109 @@ async def publish_container(token: str, threads_user_id: str,
         return last.json()["id"]
 
 
+async def create_reply_container_once(
+    token: str,
+    threads_user_id: str,
+    text: str,
+    reply_to_id: str,
+) -> str:
+    """Create one reply container without retrying permission failures."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{BASE}/v1.0/{threads_user_id}/threads",
+                params={
+                    "access_token": token,
+                    "text": text,
+                    "media_type": "TEXT",
+                    "reply_to_id": reply_to_id,
+                },
+            )
+    except httpx.HTTPError as error:
+        raise ThreadsAPIError(
+            f"Threads API reply container transport error: {type(error).__name__}"
+        ) from error
+    _raise_for_status_safe(response)
+    return response.json()["id"]
+
+
+async def publish_reply_container_once(
+    token: str,
+    threads_user_id: str,
+    container_id: str,
+) -> str:
+    """Publish once; transport/5xx failures are deliberately marked unknown."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{BASE}/v1.0/{threads_user_id}/threads_publish",
+                params={
+                    "access_token": token,
+                    "creation_id": container_id,
+                },
+            )
+    except httpx.HTTPError as error:
+        raise ThreadsPublishUnknownError(
+            f"Threads API reply publish transport error: {type(error).__name__}"
+        ) from error
+    if response.status_code >= 500:
+        safe_error = _safe_response_error(response)
+        raise ThreadsPublishUnknownError(
+            str(safe_error), status_code=response.status_code
+        )
+    _raise_for_status_safe(response)
+    published_id = response.json().get("id")
+    if not published_id:
+        raise ThreadsPublishUnknownError(
+            "Threads API reply publish returned no publication id",
+            status_code=response.status_code,
+        )
+    return str(published_id)
+
+
 async def get_replies(token: str, post_id: str) -> list[dict]:
     """Комменты первого уровня к посту."""
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(f"{BASE}/v1.0/{post_id}/replies", params={
-            "fields": "id,text,username,timestamp",
-            "access_token": token,
-        })
-        _raise_for_status_safe(r)
-        return r.json().get("data", [])
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(f"{BASE}/v1.0/{post_id}/replies", params={
+                "fields": (
+                    "id,text,username,timestamp,permalink,"
+                    "is_reply_owned_by_me,root_post,replied_to"
+                ),
+                "access_token": token,
+            })
+    except httpx.HTTPError as error:
+        raise ThreadsAPIError(
+            f"Threads API replies transport error: {type(error).__name__}"
+        ) from error
+    _raise_for_status_safe(r)
+    return r.json().get("data", [])
 
 
 # ---------- Радар (Модуль 1) ----------
 
 async def keyword_search(token: str, query: str,
-                         search_type: str = "TOP") -> list[dict]:
+                         search_type: str = "RECENT") -> list[dict]:
     """Поиск публичных постов. ВАЖНО: метрик чужих постов API не отдаёт,
     только контент. Лимит: 2200 запросов/юзер/24ч (скользящие)."""
-    async with httpx.AsyncClient(timeout=30) as c:
-        r = await c.get(f"{BASE}/v1.0/keyword_search", params={
-            "q": query,
-            "search_type": search_type,
-            "fields": "id,text,username",
-            "access_token": token,
-        })
-        _raise_for_status_safe(r)
-        return r.json().get("data", [])
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(f"{BASE}/v1.0/keyword_search", params={
+                "q": query,
+                "search_type": search_type,
+                "fields": (
+                    "id,text,username,timestamp,permalink,owner{id},"
+                    "has_replies,is_reply"
+                ),
+                "limit": 25,
+                "access_token": token,
+            })
+    except httpx.HTTPError as error:
+        raise ThreadsAPIError(
+            f"Threads API keyword search transport error: {type(error).__name__}"
+        ) from error
+    _raise_for_status_safe(r)
+    return r.json().get("data", [])
 
 
 async def get_insights(token: str, post_id: str) -> dict:
@@ -230,3 +319,26 @@ async def get_insights(token: str, post_id: str) -> dict:
                 continue
             metrics[name] = values[0]["value"]
         return metrics
+
+
+async def get_own_threads(token: str, *, limit: int = 50) -> list[dict]:
+    """Return the connected account's latest own Threads publications."""
+    safe_limit = max(1, min(int(limit), 50))
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                f"{BASE}/v1.0/me/threads",
+                params={
+                    "fields": "id,text,timestamp,permalink",
+                    "limit": safe_limit,
+                    "access_token": token,
+                },
+            )
+    except httpx.HTTPError as error:
+        raise ThreadsAPIError(
+            "Threads API own-post listing transport error: "
+            f"{type(error).__name__}"
+        ) from error
+    _raise_for_status_safe(response)
+    data = response.json().get("data", [])
+    return data if isinstance(data, list) else []

@@ -232,10 +232,12 @@ def test_new_account_gets_owned_default_settings():
     assert created is True
     autocontent_sql, autocontent_params = session.calls[0]
     neuro_sql, neuro_params = session.calls[1]
+    radar_sql, radar_params = session.calls[2]
     assert "INSERT INTO autocontent_settings" in autocontent_sql
     assert "account.user_id = :user_id" in autocontent_sql
     assert "INSERT INTO neuro_settings" in neuro_sql
-    assert autocontent_params == neuro_params == {
+    assert "INSERT INTO radar_settings" in radar_sql
+    assert autocontent_params == neuro_params == radar_params == {
         "account_id": 11,
         "user_id": 7,
     }

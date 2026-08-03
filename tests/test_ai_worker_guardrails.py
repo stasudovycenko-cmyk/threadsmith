@@ -53,55 +53,35 @@ def test_autocontent_absurd_daily_need_stops_before_database(monkeypatch):
     assert result == 0
 
 
-def test_neuro_llm_calls_are_capped_per_run(monkeypatch):
+def test_neuro_worker_claims_one_candidate_per_account_run(monkeypatch):
     calls = []
-    candidates = [
-        (f"post-{index}", f"author-{index}", "x" * 80)
-        for index in range(20)
-    ]
 
-    async def today_count(_session, _uid, _account_id):
-        return 0
-
-    async def pick_candidates(
-        _session,
-        _uid,
-        _account_id,
-        _niche,
-        *,
-        limit,
-    ):
-        assert limit == m4_jobs.NEURO_MAX_CANDIDATES_PER_RUN
-        return candidates
-
-    async def author_commented_today(
-        _session,
-        _uid,
-        _account_id,
-        _author,
-    ):
-        return False
-
-    async def generate_comment(*_args, **_kwargs):
-        calls.append(_kwargs["usage_context"])
+    async def claim_candidate(_session, *, user_id, account_id):
+        calls.append(("claim", user_id, account_id))
         return {
-            "relevant": False,
-            "skip_reason": "not relevant",
-            "comment": None,
+            "comment_id": 99,
+            "author_username": "author",
+            "post_text": "post",
+            "final_score": 88,
+            "score_reason": "relevant",
         }
 
+    async def generate_claimed(
+        _session, *, user_id, account_id, comment_id
+    ):
+        calls.append(("generate", user_id, account_id, comment_id))
+        return None
+
     monkeypatch.setattr(m4_jobs, "Session", FakeSession)
-    monkeypatch.setattr(m4_jobs.neuro, "today_count", today_count)
-    monkeypatch.setattr(m4_jobs.neuro, "pick_candidates", pick_candidates)
     monkeypatch.setattr(
         m4_jobs.neuro,
-        "author_commented_today",
-        author_commented_today,
+        "claim_candidate_for_generation",
+        claim_candidate,
     )
     monkeypatch.setattr(
         m4_jobs.neuro,
-        "generate_comment",
-        generate_comment,
+        "generate_claimed_comment",
+        generate_claimed,
     )
 
     asyncio.run(m4_jobs._hunt_for_user(
@@ -116,8 +96,10 @@ def test_neuro_llm_calls_are_capped_per_run(monkeypatch):
         acc_id=10,
     ))
 
-    assert len(calls) == m4_jobs.NEURO_MAX_LLM_CALLS_PER_RUN
-    assert all(context.threads_account_id == 10 for context in calls)
+    assert calls == [
+        ("claim", 1, 10),
+        ("generate", 1, 10, 99),
+    ]
 
 
 def test_publishing_continues_when_global_ai_is_disabled(monkeypatch):

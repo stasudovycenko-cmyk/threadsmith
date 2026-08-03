@@ -22,43 +22,60 @@ from app.core.threads_api import get_insights
 
 log = logging.getLogger("m1_jobs")
 
-# сидовые ниши - чтобы база копилась до того, как юзеры зададут свои
-SEED_NICHES = {
-    "трафик и продвижение": ["продвижение threads", "органический трафик"],
-    "заработок онлайн": ["заработок в интернете", "доход онлайн"],
-    "ai и нейросети": ["нейросети", "ai контент"],
-}
-
-
 async def library_crawler():
+    """Run account-scoped Radar discovery with each account's own token."""
     async with Session() as s:
-        user_niches = (await s.execute(text("""
-            SELECT DISTINCT niche, keywords FROM user_niches
-        """))).all()
+        accounts = (await s.execute(text("""
+            SELECT setting.user_id, setting.threads_account_id,
+                   account.access_token_enc
+            FROM radar_settings setting
+            JOIN threads_accounts account
+              ON account.id = setting.threads_account_id
+             AND account.user_id = setting.user_id
+            WHERE cardinality(setting.keywords) > 0
+              AND account.connection_status = 'connected'
+              AND account.access_token_enc IS NOT NULL
+              AND account.expires_at > now()
+              AND coalesce((
+                SELECT quota.used FROM search_quota quota
+                WHERE quota.threads_account_id = account.id
+                  AND quota.window_start = current_date
+              ), 0) < :budget
+              AND coalesce((
+                SELECT run.status FROM radar_search_runs run
+                WHERE run.user_id = setting.user_id
+                  AND run.threads_account_id = setting.threads_account_id
+                ORDER BY run.started_at DESC LIMIT 1
+              ), 'success') <> 'permission_denied'
+            ORDER BY setting.threads_account_id
+        """), {"budget": radar.CRAWL_BUDGET_PER_ACC})).all()
 
-    targets: list[tuple[str, str]] = []
-    for niche, kws in user_niches:
-        for kw in (kws or [])[:3]:
-            targets.append((niche, kw))
-    for niche, kws in SEED_NICHES.items():
-        for kw in kws:
-            targets.append((niche, kw))
-
-    for niche, query in targets:
+    for user_id, account_id, token_enc in accounts:
         async with Session() as s:
-            acc = await radar.pick_crawler_account(s)
-            if not acc:
-                log.info("crawler: суточный бюджет квот исчерпан, стоп")
-                return
-            acc_id, tok_enc, _used = acc
             try:
-                token = decrypt_token(tok_enc)
-                posts = await radar.search_and_store(s, token, acc_id, niche, query)
+                summary = await radar.discover_account_posts(
+                    s,
+                    user_id=user_id,
+                    account_id=account_id,
+                    token=decrypt_token(token_enc),
+                )
+                if summary.status == "success":
+                    await radar.semantic_score_candidates(
+                        s,
+                        user_id=user_id,
+                        account_id=account_id,
+                    )
                 await s.commit()
-                log.info("crawler: %s '%s' +%s постов", niche, query, len(posts))
+                log.info(
+                    "radar account=%s status=%s seen=%s saved=%s",
+                    account_id,
+                    summary.status,
+                    summary.results_seen,
+                    summary.candidates_saved,
+                )
             except Exception:
                 await s.rollback()
-                log.exception("crawler failed niche=%s q=%s", niche, query)
+                log.exception("radar account run failed account=%s", account_id)
 
 
 async def insights_snapshotter():
