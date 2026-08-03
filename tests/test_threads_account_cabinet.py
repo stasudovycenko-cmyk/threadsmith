@@ -2,7 +2,9 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import inspect
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +24,10 @@ from app.core.accounts import (
 from app.core.autopost_status import AutopostStatusService
 from app.core.meta_callbacks import InvalidSignedRequest, verify_signed_request
 from app.schemas.accounts import ThreadsAccount
+from scripts.migration_010_common import (
+    normalize_database_url,
+    run_read_only,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 8, 3, 12, 0, tzinfo=timezone.utc)
@@ -398,7 +404,32 @@ def test_settings_copy_is_account_scoped_and_does_not_copy_active():
     }
 
 
-def test_migration_preserves_users_and_copies_account_settings():
+def test_deletion_confirmation_is_random_and_stores_only_identity_hash():
+    session = ScriptedSession()
+    service = ThreadsAccountService(session)
+    first = asyncio.run(service.record_deletion_request(
+        "threads-secret-identity",
+        status="received",
+    ))
+    second = asyncio.run(service.record_deletion_request(
+        "threads-secret-identity",
+        status="received",
+    ))
+
+    assert re.fullmatch(r"[0-9a-f]{32}", first)
+    assert re.fullmatch(r"[0-9a-f]{32}", second)
+    assert first != second
+    for _, params in session.calls:
+        assert params["confirmation_code"] not in {
+            "threads-secret-identity",
+            params["threads_user_id_hash"],
+        }
+        assert params["threads_user_id_hash"] == hashlib.sha256(
+            b"threads-secret-identity"
+        ).hexdigest()
+
+
+def test_migration_keeps_backups_validates_copy_and_refuses_repeat_run():
     migration = (ROOT / "migrations/010_threads_account_cabinet.sql").read_text(
         encoding="utf-8"
     )
@@ -407,13 +438,55 @@ def test_migration_preserves_users_and_copies_account_settings():
     ).read_text(encoding="utf-8")
     assert "create table user_preferences" in migration.lower()
     assert "selected_threads_account_id" in migration
-    assert "left join autocontent_settings_user_legacy" in migration.lower()
+    assert "autocontent_settings_user_backup_010" in migration
+    assert "neuro_settings_user_backup_010" in migration
+    assert "drop table autocontent_settings_user_backup_010" not in migration.lower()
+    assert "drop table neuro_settings_user_backup_010" not in migration.lower()
+    assert "autocontent count mismatch" in migration
+    assert "neuro count mismatch" in migration
+    assert "already applied; refusing a repeat run" in migration
+    assert "unique (id, user_id)" in migration.lower()
+    assert "on delete no action" in migration.lower()
     assert "account.id" in migration and "account.user_id" in migration
     assert "expected_threads_account_id" in migration
     assert "action = 'reconnect'" in migration
     assert "access_token_enc drop not null" in migration.lower()
-    assert "reconnect or permanently delete" in rollback.lower()
-    assert "cannot collapse account-scoped neuro comments" in rollback.lower()
+    assert "rename to autocontent_settings" in rollback.lower()
+    assert "rename to neuro_settings" in rollback.lower()
+    assert "migration backup tables were modified" in rollback.lower()
+    assert "reconnect disconnected/error accounts first" in rollback.lower()
+
+
+def test_migration_helpers_are_read_only_and_runtime_ignores_backups():
+    preflight = (
+        ROOT / "scripts/preflight_migration_010.py"
+    ).read_text(encoding="utf-8")
+    validation = (
+        ROOT / "scripts/validate_migration_010.py"
+    ).read_text(encoding="utf-8")
+    common = (
+        ROOT / "scripts/migration_010_common.py"
+    ).read_text(encoding="utf-8")
+    assert "transaction(readonly=True)" in common
+    assert "RESULT=BLOCKED" in preflight
+    assert "RESULT={'READY' if not blockers else 'BLOCKED'}" in validation
+
+    runtime = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "app").rglob("*.py")
+    )
+    assert "autocontent_settings_user_backup_010" not in runtime
+    assert "neuro_settings_user_backup_010" not in runtime
+
+
+def test_migration_helper_normalizes_sqlalchemy_dsn_and_owns_event_loop():
+    assert normalize_database_url(
+        "postgresql+asyncpg://user:pass@db.example/database"
+    ) == "postgresql://user:pass@db.example/database"
+    assert normalize_database_url(
+        "postgresql://user:pass@db.example/database"
+    ) == "postgresql://user:pass@db.example/database"
+    assert not inspect.iscoroutinefunction(run_read_only)
 
 
 def test_runtime_sql_encodes_planner_publisher_disconnect_race_guards():
