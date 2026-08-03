@@ -71,7 +71,7 @@ def make_summary(account_id=101):
 
 
 class FakeProvider:
-    name = "fake"
+    name = "manual"
 
     def __init__(self, metrics_by_post, remote_posts=()):
         self.metrics_by_post = metrics_by_post
@@ -452,3 +452,8 @@ def test_migration_and_rollback_are_additive():
     assert "insights_snapshots" not in rollback
     assert "foreign key (threads_account_id, user_id)" in migration
     assert "analytics_snapshots_scheduled_owner_fk" in migration
+    assert "check (provider in ('threads', 'manual'))" in migration
+    assert "numeric(6, 3)" in migration
+    assert "numeric(10, 6)" in migration
+    assert "numeric(18, 3)" in migration
+    assert "analytics_post_summary_account_published_idx" in migration

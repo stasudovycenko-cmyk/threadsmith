@@ -558,6 +558,11 @@ def test_migration_has_safe_defaults_account_identity_and_uniqueness():
     assert "default false" in migration
     assert "alter column daily_cap set default 5" in migration
     assert "foreign key (threads_account_id, user_id)" in migration
+    assert (
+        "threads_account_id,\n    status,\n    final_score desc nulls last,"
+        "\n    discovered_at desc"
+    ) in migration
+    assert "on delete no action" in migration
 
 
 def test_migration_and_runtime_encode_cooldown_and_idempotent_claims():

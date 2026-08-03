@@ -147,7 +147,10 @@ create table radar_candidates (
 
 create index radar_candidates_account_status_score_idx
   on radar_candidates (
-    threads_account_id, status, final_score desc, deterministic_score desc
+    threads_account_id,
+    status,
+    final_score desc nulls last,
+    discovered_at desc
   );
 create index radar_candidates_account_author_idx
   on radar_candidates (threads_account_id, author_key, discovered_at desc);

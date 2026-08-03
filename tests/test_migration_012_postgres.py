@@ -129,3 +129,119 @@ def test_forward_backfill_account_isolation_and_rollback():
             ) == 1
 
     asyncio.run(scenario())
+
+
+def test_provider_numeric_precision_and_analytics_indexes():
+    async def scenario():
+        async with _database() as connection:
+            user_id, account_id, _ = await _seed(connection)
+            await _script(connection, FORWARD)
+
+            rows = await connection.fetch(
+                """
+                select table_name, column_name,
+                       numeric_precision, numeric_scale
+                from information_schema.columns
+                where table_schema = current_schema()
+                  and table_name in (
+                    'analytics_snapshots', 'analytics_post_summary',
+                    'analytics_aggregates', 'analytics_account_summary'
+                  )
+                  and data_type = 'numeric'
+                """
+            )
+            precision = {
+                (row["table_name"], row["column_name"]): (
+                    row["numeric_precision"], row["numeric_scale"]
+                )
+                for row in rows
+            }
+            assert precision == {
+                ("analytics_snapshots", "engagement_rate"): (10, 6),
+                ("analytics_snapshots", "performance_score"): (6, 3),
+                ("analytics_snapshots", "virality_score"): (6, 3),
+                ("analytics_snapshots", "brain_score"): (6, 3),
+                ("analytics_post_summary", "engagement_rate"): (10, 6),
+                ("analytics_post_summary", "performance_score"): (6, 3),
+                ("analytics_post_summary", "virality_score"): (6, 3),
+                ("analytics_post_summary", "brain_score"): (6, 3),
+                ("analytics_post_summary", "performance_percentile"): (10, 6),
+                ("analytics_aggregates", "avg_views"): (18, 3),
+                ("analytics_aggregates", "avg_er"): (10, 6),
+                ("analytics_aggregates", "avg_replies"): (18, 3),
+                ("analytics_aggregates", "avg_brain_score"): (6, 3),
+                ("analytics_aggregates", "avg_virality_score"): (6, 3),
+                ("analytics_aggregates", "avg_ctr"): (10, 6),
+                ("analytics_account_summary", "avg_er"): (10, 6),
+                ("analytics_account_summary", "avg_views"): (18, 3),
+                ("analytics_account_summary", "brain_score"): (6, 3),
+            }
+
+            snapshot = await connection.fetchrow(
+                """
+                update analytics_snapshots
+                set engagement_rate = 0.1234567,
+                    performance_score = 12.3456,
+                    virality_score = 98.7654,
+                    brain_score = 50.5555
+                returning provider, engagement_rate, performance_score,
+                          virality_score, brain_score
+                """
+            )
+            assert tuple(map(str, snapshot[1:])) == (
+                "0.123457", "12.346", "98.765", "50.556"
+            )
+            assert snapshot["provider"] == "threads"
+
+            await connection.execute(
+                """
+                insert into analytics_post_summary (
+                  user_id, threads_account_id, provider, threads_post_id,
+                  published_at, first_seen, last_updated,
+                  engagement_rate, performance_score, virality_score,
+                  brain_score, performance_percentile
+                ) values (
+                  $1, $2, 'manual', 'manual-post', now(), now(), now(),
+                  0.3333337, 1.2345, 2.3456, 3.4567, 88.1234567
+                )
+                """,
+                user_id,
+                account_id,
+            )
+            stored = await connection.fetchrow(
+                """
+                select engagement_rate, performance_score, virality_score,
+                       brain_score, performance_percentile
+                from analytics_post_summary
+                where threads_account_id = $1 and provider = 'manual'
+                """,
+                account_id,
+            )
+            assert tuple(map(str, stored)) == (
+                "0.333334", "1.235", "2.346", "3.457", "88.123457"
+            )
+
+            with pytest.raises(asyncpg.CheckViolationError):
+                await connection.execute(
+                    "update analytics_snapshots set provider = 'instagram'"
+                )
+            with pytest.raises(asyncpg.CheckViolationError):
+                await connection.execute(
+                    """
+                    update analytics_post_summary
+                    set provider = 'instagram'
+                    where provider = 'manual'
+                    """
+                )
+
+            index_definition = await connection.fetchval(
+                """
+                select indexdef from pg_indexes
+                where schemaname = current_schema()
+                  and indexname = 'analytics_post_summary_account_published_idx'
+                """
+            )
+            assert "threads_account_id" in index_definition
+            assert "published_at DESC" in index_definition
+
+    asyncio.run(scenario())

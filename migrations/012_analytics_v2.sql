@@ -45,10 +45,10 @@ create table analytics_snapshots (
   shares bigint,
   profile_visits bigint,
   followers bigint,
-  engagement_rate numeric,
-  performance_score numeric,
-  virality_score numeric,
-  brain_score numeric,
+  engagement_rate numeric(10, 6),
+  performance_score numeric(6, 3),
+  virality_score numeric(6, 3),
+  brain_score numeric(6, 3),
   raw_metrics jsonb not null default '{}'::jsonb,
   created_at timestamptz not null default now(),
   constraint analytics_snapshots_account_owner_fk
@@ -61,8 +61,8 @@ create table analytics_snapshots (
     on delete cascade,
   constraint analytics_snapshots_identity_unique
     unique (threads_account_id, provider, threads_post_id, snapshot_bucket),
-  constraint analytics_snapshots_provider_not_empty
-    check (btrim(provider) <> ''),
+  constraint analytics_snapshots_provider_check
+    check (provider in ('threads', 'manual')),
   constraint analytics_snapshots_post_not_empty
     check (btrim(threads_post_id) <> ''),
   constraint analytics_snapshots_counts_nonnegative check (
@@ -111,11 +111,11 @@ create table analytics_post_summary (
   shares bigint,
   profile_visits bigint,
   followers bigint,
-  engagement_rate numeric,
-  performance_score numeric,
-  virality_score numeric,
-  brain_score numeric,
-  performance_percentile numeric,
+  engagement_rate numeric(10, 6),
+  performance_score numeric(6, 3),
+  virality_score numeric(6, 3),
+  brain_score numeric(6, 3),
+  performance_percentile numeric(10, 6),
   hook_type text,
   cta_type text,
   topic text,
@@ -131,6 +131,8 @@ create table analytics_post_summary (
     on delete cascade,
   constraint analytics_post_summary_identity_unique
     unique (threads_account_id, provider, threads_post_id),
+  constraint analytics_post_summary_provider_check
+    check (provider in ('threads', 'manual')),
   constraint analytics_post_summary_counts_nonnegative check (
     (peak_views is null or peak_views >= 0)
     and (current_views is null or current_views >= 0)
@@ -164,6 +166,10 @@ create index analytics_post_summary_account_score_idx
   on analytics_post_summary (
     threads_account_id, brain_score desc nulls last
   );
+create index analytics_post_summary_account_published_idx
+  on analytics_post_summary (
+    threads_account_id, published_at desc
+  );
 create unique index analytics_post_summary_scheduled_provider_unique
   on analytics_post_summary (scheduled_post_id, provider)
   where scheduled_post_id is not null;
@@ -176,12 +182,12 @@ create table analytics_aggregates (
   dimension_key text not null,
   posts_count integer not null,
   views_total bigint,
-  avg_views numeric,
-  avg_er numeric,
-  avg_replies numeric,
-  avg_brain_score numeric,
-  avg_virality_score numeric,
-  avg_ctr numeric,
+  avg_views numeric(18, 3),
+  avg_er numeric(10, 6),
+  avg_replies numeric(18, 3),
+  avg_brain_score numeric(6, 3),
+  avg_virality_score numeric(6, 3),
+  avg_ctr numeric(10, 6),
   updated_at timestamptz not null default now(),
   constraint analytics_aggregates_account_owner_fk
     foreign key (threads_account_id, user_id)
@@ -222,8 +228,8 @@ create table analytics_account_summary (
   likes_total bigint,
   comments_total bigint,
   shares_total bigint,
-  avg_er numeric,
-  avg_views numeric,
+  avg_er numeric(10, 6),
+  avg_views numeric(18, 3),
   best_post_id text,
   worst_post_id text,
   best_hour smallint,
@@ -231,7 +237,7 @@ create table analytics_account_summary (
   best_topic text,
   best_hook text,
   best_cta text,
-  brain_score numeric,
+  brain_score numeric(6, 3),
   metric_coverage jsonb not null default '{}'::jsonb,
   updated_at timestamptz not null default now(),
   constraint analytics_account_summary_account_owner_fk

@@ -5,7 +5,11 @@ from datetime import datetime
 from typing import Any
 
 from app.core.threads_api import get_insights, get_own_threads
-from app.schemas.analytics import AnalyticsMetrics, ProviderAnalyticsPost
+from app.schemas.analytics import (
+    AnalyticsMetrics,
+    AnalyticsProviderName,
+    ProviderAnalyticsPost,
+)
 
 _COUNT_METRICS = (
     "views",
@@ -34,7 +38,7 @@ def _count(value: Any) -> int | None:
 
 
 class ThreadsAnalyticsProvider:
-    name = "threads"
+    name: AnalyticsProviderName = "threads"
 
     def __init__(self, access_token: str):
         self._access_token = access_token

@@ -21,7 +21,7 @@ ROLLBACK = (
 BASE = tuple(
     path.read_text(encoding="utf-8")
     for path in sorted((ROOT / "migrations").glob("*.sql"))
-    if not path.name.startswith("011_")
+    if path.name[:3].isdigit() and int(path.name[:3]) < 11
 )
 
 pytestmark = pytest.mark.skipif(
@@ -113,6 +113,26 @@ def test_forward_schema_defaults_constraints_and_immediate_rollback():
             assert await connection.fetchval(
                 "select to_regclass('ai_credit_events')"
             ) is not None
+            index_definition = await connection.fetchval(
+                """
+                select indexdef from pg_indexes
+                where schemaname = current_schema()
+                  and indexname = 'radar_candidates_account_status_score_idx'
+                """
+            )
+            assert "final_score DESC NULLS LAST" in index_definition
+            assert "discovered_at DESC" in index_definition
+            assert index_definition.index("final_score") < index_definition.index(
+                "discovered_at"
+            )
+            assert await connection.fetchval(
+                """
+                select confdeltype
+                from pg_constraint
+                where conrelid = 'neuro_comments'::regclass
+                  and conname = 'neuro_comments_radar_candidate_owner_fk'
+                """
+            ) == "a"
 
             await _script(connection, ROLLBACK)
             assert await connection.fetchval(

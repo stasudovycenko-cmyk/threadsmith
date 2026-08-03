@@ -11,6 +11,7 @@ AnalyticsDimension = Literal[
     "publish_hour",
     "weekday",
 ]
+AnalyticsProviderName = Literal["threads", "manual"]
 
 
 class AnalyticsModel(BaseModel):
@@ -72,7 +73,7 @@ class AnalyticsScores(AnalyticsModel):
 
 class AnalyticsSnapshotWrite(AnalyticsModel):
     post: PublishedAnalyticsPost
-    provider: str = Field(min_length=1)
+    provider: AnalyticsProviderName
     snapshot_at: AwareDatetime
     bucket_at: AwareDatetime
     metrics: AnalyticsMetrics

@@ -3,11 +3,15 @@
 from datetime import datetime
 from typing import Protocol
 
-from app.schemas.analytics import AnalyticsMetrics, ProviderAnalyticsPost
+from app.schemas.analytics import (
+    AnalyticsMetrics,
+    AnalyticsProviderName,
+    ProviderAnalyticsPost,
+)
 
 
 class AnalyticsProvider(Protocol):
-    name: str
+    name: AnalyticsProviderName
 
     async def list_recent_posts(
         self,
