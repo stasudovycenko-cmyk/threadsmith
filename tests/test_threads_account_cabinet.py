@@ -513,7 +513,7 @@ def test_main_menu_exposes_cabinet():
         for row in main_menu_kb().inline_keyboard
         for button in row
     ]
-    assert "👤 Личный кабинет" in labels
+    assert "👤 Аккаунты" in labels
 
 
 def test_claim_due_posts_requires_connected_owned_account():

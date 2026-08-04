@@ -72,8 +72,8 @@ async def _require_voice(cb: CallbackQuery, uid: int) -> dict | None:
         profile = await scenarist.get_voice(s, uid)
     if not profile:
         await cb.message.answer(
-            "Сначала обучи бота своему голосу - жми «🎙 Мой голос» "
-            "и кидай 5-10 своих постов."
+            "Сначала обучите бота своему голосу: откройте «🎙 Мой голос» "
+            "и отправьте 5-10 своих постов."
         )
         await cb.answer()
         return None
@@ -85,6 +85,13 @@ async def _single_account_id(uid: int) -> int | None:
         account = await ThreadsAccountService(s).selected_account(uid)
         await s.commit()
     return account.id if account else None
+
+
+async def _menu_account(uid: int):
+    async with Session() as session:
+        account = await ThreadsAccountService(session).selected_account(uid)
+        await session.commit()
+    return account
 
 
 async def _load_brain(uid: int, threads_account_id: int):
@@ -152,12 +159,28 @@ def _more_kb(gen_id: int) -> InlineKeyboardMarkup:
 
 @router.message(Command("scenarist"))
 async def cmd_scenarist(msg: Message):
-    await msg.answer("Сценарист. Что делаем:", reply_markup=scenarist_kb())
+    uid = await _uid(msg.from_user.id)
+    account = await _menu_account(uid) if uid is not None else None
+    account_label = f"@{account.username or account.id}" if account else "не подключён"
+    await msg.answer(
+        "✍️ Создание контента\n\n"
+        f"Аккаунт: {account_label}\n\n"
+        "Выберите, какой текст подготовить:",
+        reply_markup=scenarist_kb(),
+    )
 
 
 @router.callback_query(F.data == "sc:menu")
 async def cb_menu(cb: CallbackQuery):
-    await cb.message.answer("Сценарист. Что делаем:", reply_markup=scenarist_kb())
+    uid = await _uid(cb.from_user.id)
+    account = await _menu_account(uid) if uid is not None else None
+    account_label = f"@{account.username or account.id}" if account else "не подключён"
+    await cb.message.answer(
+        "✍️ Создание контента\n\n"
+        f"Аккаунт: {account_label}\n\n"
+        "Выберите, какой текст подготовить:",
+        reply_markup=scenarist_kb(),
+    )
     await cb.answer()
 
 
@@ -168,8 +191,9 @@ async def cb_voice(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Voice.collecting)
     await state.update_data(posts=[])
     await cb.message.answer(
-        "Кидай свои посты, каждый отдельным сообщением, 5-10 штук.\n"
-        "Чем разнообразнее, тем точнее профиль. Когда всё - жми /done"
+        "Отправьте 5-10 своих постов, каждый отдельным сообщением.\n"
+        "Чем разнообразнее примеры, тем точнее профиль. Когда закончите, "
+        "отправьте /done. Для отмены: /cancel."
     )
     await cb.answer()
 
@@ -217,9 +241,18 @@ async def voice_done(msg: Message, state: FSMContext):
     taboo = ", ".join(profile.get("taboo", [])[:4])
     await msg.answer(
         f"✅ Голос сохранён.\n\nМанера: {profile.get('tone', '-')}\n"
-        f"Табу: {taboo}\n\nТеперь генерация пишет как ты.",
+        f"Табу: {taboo}\n\nТеперь генерация учитывает ваш голос.",
         reply_markup=scenarist_kb(),
     )
+
+
+@router.message(Voice.collecting, Command("cancel"))
+@router.message(Gen.topic, Command("cancel"))
+@router.message(Rewrite.source, Command("cancel"))
+@router.message(Thread.topic, Command("cancel"))
+async def cancel_generation_input(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Ввод отменён. Генерация не запускалась.")
 
 
 @router.message(Voice.collecting)
@@ -228,7 +261,7 @@ async def voice_collect(msg: Message, state: FSMContext):
     posts = data.get("posts", [])
     posts.append(msg.text or "")
     await state.update_data(posts=posts)
-    await msg.answer(f"Принял ({len(posts)}). Ещё или /done")
+    await msg.answer(f"Принято: {len(posts)}. Отправьте ещё пост или /done.")
 
 
 # ---------- генерация поста ----------
@@ -240,8 +273,8 @@ async def cb_gen(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(Gen.topic)
     await cb.message.answer(
-        "Тема поста? Можно добавить пост-референс после темы с новой строки - "
-        "украду механику."
+        "Напишите тему поста. Референс можно добавить с новой строки: "
+        "его структура станет ориентиром.\nДля отмены: /cancel"
     )
     await cb.answer()
 
@@ -266,7 +299,10 @@ async def cb_rw(cb: CallbackQuery, state: FSMContext):
     if not await _require_voice(cb, uid):
         return
     await state.set_state(Rewrite.source)
-    await cb.message.answer("Кидай пост - чужой или свой старый. Перепишу твоим голосом.")
+    await cb.message.answer(
+        "Отправьте исходный пост. Текст будет переписан вашим голосом.\n"
+        "Для отмены: /cancel"
+    )
     await cb.answer()
 
 
@@ -286,7 +322,7 @@ async def cb_thread(cb: CallbackQuery, state: FSMContext):
     if not await _require_voice(cb, uid):
         return
     await state.set_state(Thread.topic)
-    await cb.message.answer("Тема ветки?")
+    await cb.message.answer("Напишите тему ветки. Для отмены: /cancel")
     await cb.answer()
 
 

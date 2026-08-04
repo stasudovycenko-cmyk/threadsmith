@@ -20,7 +20,7 @@ ROLLBACK = (
 BASE = tuple(
     path.read_text(encoding="utf-8")
     for path in sorted((ROOT / "migrations").glob("*.sql"))
-    if not path.name.startswith("012_")
+    if int(path.name.split("_", 1)[0]) < 12
 )
 
 pytestmark = pytest.mark.skipif(

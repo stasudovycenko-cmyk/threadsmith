@@ -136,6 +136,10 @@ async def threads_callback(request: Request):
         )
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
+                text="🚀 Настроить за 2 минуты",
+                callback_data=f"ob:start:{outcome.account_id}",
+            )],
+            [InlineKeyboardButton(
                 text="✅ Сделать активным",
                 callback_data=f"cab:select:{outcome.account_id}",
             )],
@@ -212,11 +216,11 @@ async def threads_callback(request: Request):
         )
     if outcome.status == "reconnect_mismatch":
         return HTMLResponse(
-            "<h3>Авторизован другой аккаунт. Вернись в бот и выбери действие.</h3>",
+            "<h3>Авторизован другой аккаунт. Вернитесь в бот и выберите действие.</h3>",
             status_code=409,
         )
     return HTMLResponse(
-        "<h3>Готово. Авторизация обновлена, возвращайся в бот.</h3>"
+        "<h3>Готово. Авторизация обновлена, вернитесь в бот.</h3>"
     )
 
 

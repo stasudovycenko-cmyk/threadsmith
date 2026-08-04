@@ -14,22 +14,14 @@ from app.core.db import Session
 from app.core.robokassa import payment_link
 from app.core.threads_api import auth_link
 from app.bot.handlers.nav import NAV_KB
+from app.bot.handlers.dashboard import show_dashboard
+from app.bot.ux import dashboard_keyboard, navigation_row
 
 router = Router()
 
 
 def main_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✍️ Сценарист", callback_data="sc:menu"),
-         InlineKeyboardButton(text="🚀 Автопилот", callback_data="ap:menu")],
-        [InlineKeyboardButton(text="🤖 Нейрокомментинг", callback_data="nc:menu")],
-        [InlineKeyboardButton(text="📡 Радар", callback_data="rd:menu"),
-         InlineKeyboardButton(text="🔗 Подключить Threads", callback_data="connect")],
-        [InlineKeyboardButton(text="👤 Личный кабинет", callback_data="cab:menu")],
-        [InlineKeyboardButton(text="💳 Тарифы", callback_data="plans"),
-         InlineKeyboardButton(text="⚡ Баланс", callback_data="balance")],
-        [InlineKeyboardButton(text="📄 Документы", callback_data="docs:menu")],
-    ])
+    return dashboard_keyboard("advanced")
 
 
 @router.message(CommandStart())
@@ -71,13 +63,11 @@ async def cmd_start(msg: Message, command: CommandObject):
             """), {"uid": uid})
         await s.commit()
 
-    await msg.answer("Навигация — кнопки снизу 👇", reply_markup=NAV_KB)
     await msg.answer(
-        "Бот для Threads: тренды ниши, посты твоим голосом, автопостинг "
-        "и автоответы по кодовым словам.\n\n"
-        f"На старте {PLANS['free']['credits']} кредитов - хватит пощупать генерацию.",
-        reply_markup=main_kb(),
+        "ThreadFlow готов. Главная навигация всегда доступна снизу.",
+        reply_markup=NAV_KB,
     )
+    await show_dashboard(msg, msg.from_user.id)
 
 
 @router.callback_query(F.data == "balance")
@@ -88,10 +78,16 @@ async def cb_balance(cb: CallbackQuery):
             FROM users u LEFT JOIN subscriptions sub ON sub.user_id = u.id
             WHERE u.telegram_id = :tg
         """), {"tg": cb.from_user.id})).first()
-    bal, plan = (row[0], row[1]) if row else (0, "free")
+    if row is None:
+        await cb.answer("Сначала нажмите /start", show_alert=True)
+        return
+    bal, plan = row[0], row[1]
     await cb.message.answer(
         f"Тариф: {PLANS.get(plan, PLANS['free'])['title']}\n"
-        f"Кредитов: {bal}"
+        f"Кредитов: {bal}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            navigation_row("ux:settings")
+        ]),
     )
     await cb.answer()
 
@@ -102,13 +98,14 @@ async def cb_connect(cb: CallbackQuery):
         service = ThreadsAccountService(s)
         user_id = await service.user_id_for_telegram(cb.from_user.id)
         if user_id is None:
-            await cb.answer("Жми /start сначала", show_alert=True)
+            await cb.answer("Сначала нажмите /start", show_alert=True)
             return
         oauth = await service.create_oauth_state(user_id, action="connect")
         await s.commit()
 
     await cb.message.answer(
-        "Подключение Threads-аккаунта. Жми, логинься, подтверждай доступы:",
+        "Подключение Threads-аккаунта. Войдите в нужный аккаунт и "
+        "подтвердите доступ:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Подключить", url=auth_link(oauth.state))
         ]]),
@@ -125,6 +122,7 @@ async def cb_plans(cb: CallbackQuery):
         )]
         for code, p in PLANS.items() if p["price"] > 0
     ]
+    kb.append(navigation_row("ux:settings"))
     await cb.message.answer(
         "Тарифы. Кредиты зачисляются сразу после оплаты:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
@@ -145,7 +143,7 @@ async def cb_buy(cb: CallbackQuery):
             "SELECT id FROM users WHERE telegram_id = :tg"
         ), {"tg": cb.from_user.id})).first()
         if not row:
-            await cb.answer("Жми /start сначала", show_alert=True)
+            await cb.answer("Сначала нажмите /start", show_alert=True)
             return
         uid = row[0]
         inv = (await s.execute(text("""
@@ -162,9 +160,11 @@ async def cb_buy(cb: CallbackQuery):
     )
     await cb.message.answer(
         f"Оплата тарифа {plan['title']} - {plan['price']}₽.\n"
-        "После оплаты кредиты упадут автоматом, пришлю подтверждение:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Оплатить", url=link)
-        ]]),
+        "После оплаты кредиты зачислятся автоматически, а бот пришлёт "
+        "подтверждение:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Оплатить", url=link)],
+            navigation_row("plans"),
+        ]),
     )
     await cb.answer()

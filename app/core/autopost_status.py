@@ -1452,10 +1452,13 @@ def render_status(
 ) -> str:
     enabled = status.settings.enabled
     lines = [
-        "✨ АВТОПОСТИНГ",
+        "✍️ Автопилот",
         "",
-        f"Статус: {'🟢 Работает' if enabled else '⚪ Выключен'}",
         f"Аккаунт: @{status.account.username or status.account.id}",
+        f"Статус: {'🟢 Включён' if enabled else '⚪ Выключен'}",
+        "",
+        "Создаёт и публикует посты по заданному расписанию.",
+        "",
         f"Постов в день: {status.settings.posts_per_day}",
         f"Расписание: {serialize_slots(status.settings.slots) or 'не задано'}",
         f"Часовой пояс: {status.settings.timezone}",

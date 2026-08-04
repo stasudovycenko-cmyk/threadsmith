@@ -4,6 +4,7 @@ import json
 import logging
 
 from aiogram import F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -21,6 +22,12 @@ from app.core.config import CREDIT_COSTS
 from app.core.crypto import decrypt_token
 from app.core.db import Session
 from app.core.llm import LLMError, LLMGuardError
+from app.bot.ux import (
+    format_local_time,
+    format_number,
+    navigation_row,
+    render_error,
+)
 
 log = logging.getLogger("radar_bot")
 router = Router()
@@ -32,13 +39,17 @@ class Niche(StatesGroup):
 
 def radar_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Запустить поиск", callback_data="rd:search")],
+        [InlineKeyboardButton(text="🔎 Найти посты сейчас", callback_data="rd:search")],
         [
-            InlineKeyboardButton(text="Ниша и keywords", callback_data="rd:niche"),
-            InlineKeyboardButton(text="История", callback_data="rd:history"),
+            InlineKeyboardButton(text="📋 Подходящие посты", callback_data="rd:ready"),
+            InlineKeyboardButton(text="🕘 История поиска", callback_data="rd:history"),
         ],
-        [InlineKeyboardButton(text="Мои посты", callback_data="rd:my")],
-        [InlineKeyboardButton(text="Главная", callback_data="home")],
+        [
+            InlineKeyboardButton(text="🔑 Ключевые слова", callback_data="rd:niche"),
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="rd:settings"),
+        ],
+        [InlineKeyboardButton(text="ℹ️ Как это работает", callback_data="help:radar")],
+        navigation_row("home"),
     ])
 
 
@@ -76,33 +87,77 @@ async def cb_menu(cb: CallbackQuery):
     async with Session() as session:
         row = (await session.execute(text("""
             SELECT setting.niche, setting.keywords, setting.language,
+                   coalesce(content.timezone, 'Europe/Moscow'),
                    (SELECT count(*) FROM radar_candidates candidate
                     WHERE candidate.user_id = :user_id
                       AND candidate.threads_account_id = :account_id
                       AND candidate.status = 'ready'),
-                   (SELECT max(final_score) FROM radar_candidates candidate
+                   (SELECT count(*) FROM radar_candidates candidate
                     WHERE candidate.user_id = :user_id
                       AND candidate.threads_account_id = :account_id
-                      AND candidate.status = 'ready'),
+                      AND candidate.status IN ('discovered', 'scoring')),
+                   (SELECT final_score FROM radar_candidates candidate
+                    WHERE candidate.user_id = :user_id
+                      AND candidate.threads_account_id = :account_id
+                      AND candidate.status = 'ready'
+                    ORDER BY final_score DESC NULLS LAST,
+                             discovered_at DESC LIMIT 1),
                    (SELECT status FROM radar_search_runs run
+                    WHERE run.user_id = :user_id
+                      AND run.threads_account_id = :account_id
+                    ORDER BY started_at DESC LIMIT 1),
+                   (SELECT started_at FROM radar_search_runs run
+                    WHERE run.user_id = :user_id
+                      AND run.threads_account_id = :account_id
+                    ORDER BY started_at DESC LIMIT 1),
+                   (SELECT results_seen FROM radar_search_runs run
                     WHERE run.user_id = :user_id
                       AND run.threads_account_id = :account_id
                     ORDER BY started_at DESC LIMIT 1)
             FROM radar_settings setting
+            LEFT JOIN autocontent_settings content
+              ON content.user_id = setting.user_id
+             AND content.threads_account_id = setting.threads_account_id
             WHERE setting.user_id = :user_id
               AND setting.threads_account_id = :account_id
         """), {"user_id": user_id, "account_id": account.id})).first()
-    niche, keywords, language, ready_count, best_score, last_status = row
+    (
+        niche, keywords, language, timezone_name, ready_count, waiting_count,
+        best_score, last_status, last_search_at, results_seen,
+    ) = row
     keyword_text = ", ".join(keywords or []) or "не заданы"
+    status_labels = {
+        "success": "🟢 Поиск завершён",
+        "running": "🟡 Идёт поиск",
+        "permission_denied": "🔴 Нужны разрешения Threads",
+        "failed": "🟡 Последний поиск не завершён",
+    }
+    lines = [
+        "🎯 Radar",
+        "",
+        f"Аккаунт: @{account.username or account.id}",
+        f"Статус: {status_labels.get(last_status, '⚪ Первый поиск ещё не запускался')}",
+        "",
+        "Ищет публичные обсуждения по вашей теме, где можно оставить "
+        "полезный комментарий и получить новые просмотры.",
+        "",
+        "Последний поиск: " + (
+            format_local_time(last_search_at, timezone_name)
+            if last_search_at
+            else "ещё не запускался"
+        ),
+        f"Просмотрено результатов: {results_seen or 0}",
+        f"Подходящих постов: {ready_count or 0}",
+        f"Ждут оценки: {waiting_count or 0}",
+        "Лучшая оценка: "
+        + (str(best_score) if best_score is not None else "нет данных"),
+        "",
+        f"Тема: {niche or 'не задана'}",
+        f"Ключевые слова: {keyword_text}",
+        f"Язык: {'русский' if language == 'ru' else language}",
+    ]
     await cb.message.answer(
-        f"Radar для @{account.username or account.id}\n"
-        f"Статус: {'готов' if keywords else 'нужны keywords'}\n"
-        f"Ниша: {niche or 'не задана'}\n"
-        f"Keywords: {keyword_text}\n"
-        f"Язык: {language}\n"
-        f"Готовых кандидатов: {ready_count}\n"
-        f"Лучший score: {best_score if best_score is not None else '-'}\n"
-        f"Последний поиск: {last_status or '-'}",
+        "\n".join(lines),
         reply_markup=radar_kb(),
     )
     await cb.answer()
@@ -116,17 +171,29 @@ async def cb_niche(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Niche.setup)
     await state.update_data(account_id=account.id)
     await cb.message.answer(
-        "Укажите нишу и keywords через запятую.\n"
-        "Пример: AI для бизнеса, автоматизация, нейросети, контент"
+        f"🔑 Ключевые слова для @{account.username or account.id}\n\n"
+        "Укажите тему и ключевые слова через запятую.\n"
+        "Пример: AI для бизнеса, автоматизация, нейросети, контент.\n\n"
+        "Для отмены используйте /cancel."
     )
     await cb.answer()
+
+
+@router.message(Niche.setup, Command("cancel"))
+async def cancel_niche(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Ввод отменён. Настройки не изменены.")
 
 
 @router.message(Niche.setup)
 async def niche_setup(msg: Message, state: FSMContext):
     parts = [part.strip() for part in (msg.text or "").split(",") if part.strip()]
     if not parts:
-        await msg.answer("Формат: ниша, keyword 1, keyword 2")
+        await msg.answer(
+            "Не удалось распознать тему.\n"
+            "Формат: тема, ключевое слово 1, ключевое слово 2.\n"
+            "Для отмены: /cancel"
+        )
         return
     state_data = await state.get_data()
     await state.clear()
@@ -159,7 +226,8 @@ async def niche_setup(msg: Message, state: FSMContext):
         await session.commit()
     await msg.answer(
         f"Аккаунт: @{account.username or account.id}\n"
-        f"Ниша: {niche}\nKeywords: {', '.join(keywords)}",
+        f"Тема: {niche}\nКлючевые слова: {', '.join(keywords)}\n\n"
+        "Сохранено. Следующий поиск будет использовать новые слова.",
         reply_markup=radar_kb(),
     )
 
@@ -188,19 +256,29 @@ async def cb_search(cb: CallbackQuery):
             "manual radar failed user=%s account=%s error_type=%s",
             user_id, account.id, type(error).__name__,
         )
-        await cb.message.answer("Поиск временно не завершён. Попробуйте позже.")
+        await cb.message.answer(render_error("threads_temporary"))
         return
     if summary.status == "permission_denied":
         await cb.message.answer(
-            "Threads не дал разрешение на keyword search. "
-            "Проверьте App Review и переподключите аккаунт."
+            render_error("permission_denied"),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🔄 Переподключить аккаунт",
+                    callback_data=f"cab:reconnect:{account.id}",
+                )],
+                navigation_row("rd:menu"),
+            ]),
         )
         return
     if summary.status == "failed":
         message = {
-            "NO_KEYWORDS": "Сначала задайте keywords для выбранного аккаунта.",
-            "SEARCH_QUOTA_EXHAUSTED": "Суточная квота поиска исчерпана.",
-        }.get(summary.error_code, "Threads search временно не завершён.")
+            "NO_KEYWORDS": (
+                "Сначала добавьте ключевые слова для выбранного аккаунта."
+            ),
+            "SEARCH_QUOTA_EXHAUSTED": (
+                "Лимит поиска на сегодня исчерпан. Новый поиск будет доступен завтра."
+            ),
+        }.get(summary.error_code, render_error("threads_temporary"))
         await cb.message.answer(message)
         return
     async with Session() as session:
@@ -214,19 +292,92 @@ async def cb_search(cb: CallbackQuery):
         """), {"user_id": user_id, "account_id": account.id})).first()
     await cb.message.answer(
         f"Поиск завершён для @{account.username or account.id}.\n"
-        f"Результатов API: {summary.results_seen}\n"
-        f"Сохранено: {summary.candidates_saved}\n"
-        f"Отфильтровано: {summary.filtered}\n"
-        f"Дублей: {summary.duplicates}"
+        f"Просмотрено результатов: {summary.results_seen}\n"
+        f"Подходящих постов: {summary.candidates_saved}\n"
+        f"Не подошли: {summary.filtered}\n"
+        f"Уже были найдены раньше: {summary.duplicates}"
     )
     if best:
         author, body, score, reason, permalink = best
         await cb.message.answer(
-            f"Лучший кандидат: @{author or 'unknown'}\n"
+            f"Лучший подходящий пост: @{author or 'автор'}\n"
             f"Оценка: {score}/100\n"
             f"Почему: {reason or '-'}\n\n"
             f"{body[:500]}\n\n{permalink or ''}"
         )
+
+
+@router.callback_query(F.data == "rd:ready")
+async def cb_ready(cb: CallbackQuery):
+    user_id, account = await _require_selected(cb)
+    if account is None:
+        return
+    async with Session() as session:
+        rows = (await session.execute(text("""
+            SELECT author_username, post_text, final_score, permalink
+            FROM radar_candidates
+            WHERE user_id = :user_id
+              AND threads_account_id = :account_id
+              AND status = 'ready'
+            ORDER BY final_score DESC NULLS LAST, discovered_at DESC
+            LIMIT 10
+        """), {"user_id": user_id, "account_id": account.id})).all()
+    if not rows:
+        message = (
+            f"📋 Подходящие посты\n\nАккаунт: @{account.username or account.id}\n\n"
+            "Пока подходящих постов не найдено. Попробуйте добавить более "
+            "широкие ключевые слова."
+        )
+    else:
+        lines = ["📋 Подходящие посты", "", f"Аккаунт: @{account.username or account.id}"]
+        for index, (author, body, score, permalink) in enumerate(rows, 1):
+            lines.extend([
+                "",
+                f"{index}. @{author or 'автор'} · Оценка {score or 0}",
+                " ".join(body.split())[:180],
+                permalink or "",
+            ])
+        message = "\n".join(lines).rstrip()
+    await cb.message.answer(message, reply_markup=radar_kb())
+    await cb.answer()
+
+
+@router.callback_query(F.data == "rd:settings")
+async def cb_settings(cb: CallbackQuery):
+    user_id, account = await _require_selected(cb)
+    if account is None:
+        return
+    async with Session() as session:
+        row = (await session.execute(text("""
+            SELECT niche, keywords, language, max_age_hours
+            FROM radar_settings
+            WHERE user_id = :user_id
+              AND threads_account_id = :account_id
+        """), {"user_id": user_id, "account_id": account.id})).first()
+    if row is None:
+        await cb.answer("Настройки не найдены", show_alert=True)
+        return
+    niche, keywords, language, max_age_hours = row
+    language_label = {"ru": "русский", "en": "английский", "any": "любой"}.get(
+        language, "не указан"
+    )
+    await cb.message.answer(
+        "⚙️ Настройки Radar\n\n"
+        f"Аккаунт: @{account.username or account.id}\n"
+        f"Тема: {niche or 'не задана'}\n"
+        f"Ключевые слова: {', '.join(keywords or []) or 'не заданы'}\n"
+        f"Язык: {language_label}\n"
+        f"Возраст публикаций: до {max_age_hours} ч.\n\n"
+        "Изменить тему и ключевые слова можно отдельной кнопкой.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔑 Изменить ключевые слова",
+                callback_data="rd:niche",
+            )],
+            navigation_row("rd:menu"),
+        ]),
+    )
+    await cb.answer()
 
 
 @router.callback_query(F.data == "rd:history")
@@ -236,22 +387,37 @@ async def cb_history(cb: CallbackQuery):
         return
     async with Session() as session:
         rows = (await session.execute(text("""
-            SELECT status, results_seen, candidates_saved,
+            SELECT run.status, run.results_seen, run.candidates_saved,
                    filtered_count, duplicate_count, started_at, error_code
-            FROM radar_search_runs
-            WHERE user_id = :user_id AND threads_account_id = :account_id
-            ORDER BY started_at DESC LIMIT 8
+            FROM radar_search_runs run
+            WHERE run.user_id = :user_id
+              AND run.threads_account_id = :account_id
+            ORDER BY run.started_at DESC LIMIT 8
         """), {"user_id": user_id, "account_id": account.id})).all()
+        timezone_name = (await session.execute(text("""
+            SELECT coalesce(timezone, 'Europe/Moscow')
+            FROM autocontent_settings
+            WHERE user_id = :user_id
+              AND threads_account_id = :account_id
+        """), {"user_id": user_id, "account_id": account.id})).scalar_one_or_none()
     if not rows:
         await cb.message.answer("История поиска пока пуста.")
     else:
-        lines = ["Последние поиски:"]
+        lines = ["🕘 История поиска", "", f"Аккаунт: @{account.username or account.id}"]
+        status_labels = {
+            "success": "Завершён",
+            "permission_denied": "Недостаточно разрешений",
+            "failed": "Не завершён",
+            "running": "Выполняется",
+        }
         for status, seen, saved, filtered, duplicates, started_at, error in rows:
-            lines.append(
-                f"{started_at:%d.%m %H:%M}: {status}, "
-                f"seen={seen}, saved={saved}, filtered={filtered}, "
-                f"duplicates={duplicates}{f', {error}' if error else ''}"
-            )
+            lines.extend([
+                "",
+                f"{format_local_time(started_at, timezone_name or 'Europe/Moscow')} · "
+                f"{status_labels.get(status, 'Не завершён')}",
+                f"Просмотрено: {seen} · Найдено: {saved}",
+                f"Не подошли: {filtered} · Повторы: {duplicates}",
+            ])
         await cb.message.answer("\n".join(lines))
     await cb.answer()
 
@@ -325,9 +491,9 @@ async def cb_my(cb: CallbackQuery):
                 else json.loads(metrics_json)
             )
             lines.append(
-                f"{body[:70]}\nviews={metrics.get('views', 0)}, "
-                f"likes={metrics.get('likes', 0)}, "
-                f"replies={metrics.get('replies', 0)}"
+                f"{body[:70]}\nПросмотры: {format_number(metrics.get('views'))}, "
+                f"реакции: {format_number(metrics.get('likes'))}, "
+                f"ответы: {format_number(metrics.get('replies'))}"
             )
         await cb.message.answer("\n\n".join(lines))
     await cb.answer()

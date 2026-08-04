@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -25,6 +26,7 @@ from app.core.autopost_status import (
     serialize_slots,
 )
 from app.core.db import Session
+from app.bot.ux import navigation_row
 
 log = logging.getLogger("autocontent_ui")
 router = Router()
@@ -85,6 +87,33 @@ async def _readiness(uid: int) -> tuple[bool, bool]:
     return (bool(row[0]), bool(row[1])) if row else (False, False)
 
 
+async def _overview_details(
+    uid: int,
+    account_id: int,
+) -> tuple[int, int, str]:
+    async with Session() as session:
+        row = (await session.execute(text("""
+            SELECT
+              (SELECT count(*) FROM scheduled_posts post
+               WHERE post.user_id = setting.user_id
+                 AND post.threads_account_id = setting.threads_account_id
+                 AND post.status = 'done'
+                 AND (post.run_at AT TIME ZONE setting.timezone)::date =
+                     (now() AT TIME ZONE setting.timezone)::date),
+              (SELECT count(*) FROM scheduled_posts post
+               WHERE post.user_id = setting.user_id
+                 AND post.threads_account_id = setting.threads_account_id
+                 AND post.status IN ('pending', 'publishing')),
+              setting.goal
+            FROM autocontent_settings setting
+            WHERE setting.user_id = :uid
+              AND setting.threads_account_id = :account_id
+        """), {"uid": uid, "account_id": account_id})).first()
+    if row is None:
+        return 0, 0, ""
+    return int(row[0] or 0), int(row[1] or 0), str(row[2] or "")
+
+
 async def _load_menu(uid: int, account_id: int | None = None):
     async with Session() as session:
         account_service = ThreadsAccountService(session)
@@ -92,12 +121,17 @@ async def _load_menu(uid: int, account_id: int | None = None):
         accounts = await service.list_accounts(uid)
         if not accounts:
             return None, []
-        selected = await account_service.selected_account(uid)
-        selected_id = account_id or (
-            selected.id if selected else accounts[0].id
+        selected = (
+            await account_service.select_account(uid, account_id)
+            if account_id is not None
+            else await account_service.selected_account(uid)
         )
+        if selected is None:
+            return None, accounts
+        selected_id = selected.id
         await account_service.ensure_settings(uid, selected_id)
         status = await service.get_status(uid, selected_id)
+        await session.commit()
         return status, accounts
 
 
@@ -110,12 +144,38 @@ def _account_callback_id(data: str) -> int | None:
 
 async def _resolved_account_id(uid: int, data: str) -> int | None:
     explicit = _account_callback_id(data)
-    if explicit is not None:
-        return explicit
+    async with Session() as session:
+        accounts = ThreadsAccountService(session)
+        if explicit is not None:
+            owned = await accounts.select_account(uid, explicit)
+            await session.commit()
+            return owned.id if owned is not None else None
+        selected = await accounts.selected_account(uid)
+        await session.commit()
+    return selected.id if selected else None
+
+
+async def _state_account(
+    msg: Message,
+    state: FSMContext,
+) -> tuple[int, int] | None:
+    data = await state.get_data()
+    account_id = data.get("account_id")
+    uid = await _uid(msg.from_user.id)
+    if uid is None or not isinstance(account_id, int):
+        await state.clear()
+        await msg.answer("Сессия настройки завершилась. Откройте её заново.")
+        return None
     async with Session() as session:
         selected = await ThreadsAccountService(session).selected_account(uid)
         await session.commit()
-    return selected.id if selected else None
+    if selected is None or selected.id != account_id:
+        await state.clear()
+        await msg.answer(
+            "Активный аккаунт изменился. Откройте настройку заново."
+        )
+        return None
+    return uid, account_id
 
 
 def _menu_kb(status, accounts) -> InlineKeyboardMarkup:
@@ -140,42 +200,27 @@ def _menu_kb(status, accounts) -> InlineKeyboardMarkup:
             text=(
                 "⏸ Остановить"
                 if active
-                else "▶️ Включить автопостинг"
+                else "▶️ Включить Автопилот"
             ),
-            callback_data=f"ac:toggle:{account_id}",
+            callback_data=f"ac:set_active:{account_id}:{0 if active else 1}",
+        )],
+        [
+            InlineKeyboardButton(
+                text="📋 Очередь", callback_data=f"ap:queue:{account_id}"
+            ),
+            InlineKeyboardButton(
+                text="🕘 История", callback_data=f"ac:history:{account_id}"
+            ),
+        ],
+        [InlineKeyboardButton(
+            text="⚙️ Настройки",
+            callback_data=f"ac:settings:{account_id}",
         )],
         [InlineKeyboardButton(
-            text=f"🎚 Постов в день: {status.settings.posts_per_day}",
-            callback_data=f"ac:cap:{account_id}",
+            text="ℹ️ Как это работает",
+            callback_data="help:autopilot",
         )],
-        [InlineKeyboardButton(
-            text="🕐 Расписание",
-            callback_data=f"ac:sched:{account_id}",
-        )],
-        [InlineKeyboardButton(
-            text="📝 Темы постов",
-            callback_data=f"ac:topics:{account_id}",
-        )],
-        [InlineKeyboardButton(
-            text="🎯 Цель",
-            callback_data=f"ac:goal:{account_id}",
-        )],
-        [InlineKeyboardButton(
-            text="📋 Очередь",
-            callback_data=f"ap:queue:{account_id}",
-        )],
-        [InlineKeyboardButton(
-            text="📋 История",
-            callback_data=f"ac:history:{account_id}",
-        )],
-        [InlineKeyboardButton(
-            text="🔄 Обновить статус",
-            callback_data=f"ac:refresh:{account_id}",
-        )],
-        [InlineKeyboardButton(
-            text="⬅️ Назад",
-            callback_data="ap:menu",
-        )],
+        navigation_row("home"),
     ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -231,27 +276,36 @@ async def _show_menu(
     if uid is None:
         await cb.answer("Пользователь не найден", show_alert=True)
         return
-    has_voice, has_niche = await _readiness(uid)
-    missing = []
-    if not has_voice:
-        missing.append("голос (Сценарист → Мой голос)")
-    if not has_niche:
-        missing.append("ниша (Радар → Моя ниша)")
-    if missing:
-        await cb.message.answer(
-            "Для автопостинга нужно: " + ", ".join(missing)
-        )
-        await cb.answer()
-        return
-
     status, accounts = await _load_menu(uid, account_id)
     if status is None:
         await cb.message.answer(
-            "Сначала подключи Threads: /start → Подключить Threads"
+            "Сначала подключите Threads-аккаунт. После подключения можно "
+            "пройти настройку за две минуты."
         )
         await cb.answer()
         return
+    has_voice, has_niche = await _readiness(uid)
+    posts_today, queued, goal = await _overview_details(
+        uid, status.account.id
+    )
+    missing = []
+    if not has_voice:
+        missing.append("профиль голоса")
+    if not has_niche:
+        missing.append("тематика аккаунта")
     message_text = render_status(status)
+    message_text += (
+        f"\n\nСегодня: {posts_today} из "
+        f"{status.settings.posts_per_day} постов"
+        f"\nВ очереди: {queued}"
+        f"\nЦель: {goal or 'не задана'}"
+    )
+    if missing:
+        message_text += (
+            "\n\nПеред включением настройте: "
+            + ", ".join(missing)
+            + "."
+        )
     keyboard = _menu_kb(status, accounts)
     try:
         if edit:
@@ -283,6 +337,49 @@ async def cb_refresh(cb: CallbackQuery):
     )
 
 
+@router.callback_query(F.data.startswith("ac:settings:"))
+async def cb_settings(cb: CallbackQuery):
+    uid = await _uid(cb.from_user.id)
+    account_id = _account_callback_id(cb.data)
+    status, _ = await _load_menu(uid, account_id)
+    if status is None:
+        await cb.answer("Аккаунт не найден", show_alert=True)
+        return
+    account_id = status.account.id
+    await cb.message.answer(
+        f"⚙️ Настройки Автопилота\n\n"
+        f"Аккаунт: @{status.account.username or account_id}\n\n"
+        f"Постов в день: {status.settings.posts_per_day}\n"
+        f"Расписание: {serialize_slots(status.settings.slots) or 'не задано'}\n"
+        f"Часовой пояс: {status.settings.timezone}\n\n"
+        "После изменения расписания можно безопасно перестроить будущую очередь.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="Лимит в день",
+                callback_data=f"ac:cap:{account_id}",
+            )],
+            [InlineKeyboardButton(
+                text="🕒 Расписание",
+                callback_data=f"ac:sched:{account_id}",
+            )],
+            [InlineKeyboardButton(
+                text="📝 Темы",
+                callback_data=f"ac:topics:{account_id}",
+            )],
+            [InlineKeyboardButton(
+                text="🎯 Цель",
+                callback_data=f"ac:goal:{account_id}",
+            )],
+            [InlineKeyboardButton(
+                text="🔄 Обновить статус",
+                callback_data=f"ac:refresh:{account_id}",
+            )],
+            navigation_row(f"ac:menu:{account_id}"),
+        ]),
+    )
+    await cb.answer()
+
+
 @router.callback_query(F.data == "ac:toggle")
 @router.callback_query(F.data.startswith("ac:toggle:"))
 async def cb_toggle(cb: CallbackQuery):
@@ -312,6 +409,42 @@ async def cb_toggle(cb: CallbackQuery):
     await _show_menu(cb, account_id=account_id, edit=True)
 
 
+@router.callback_query(F.data.startswith("ac:set_active:"))
+async def cb_set_active(cb: CallbackQuery):
+    try:
+        _, _, account_raw, active_raw = cb.data.split(":", 3)
+        account_id = int(account_raw)
+        desired = active_raw == "1"
+    except (TypeError, ValueError):
+        await cb.answer("Некорректная команда", show_alert=True)
+        return
+    uid = await _uid(cb.from_user.id)
+    async with Session() as session:
+        row = (
+            await session.execute(text("""
+                UPDATE autocontent_settings
+                SET active = :active, updated_at = now()
+                WHERE user_id = :uid
+                  AND threads_account_id = :account_id
+                  AND active IS DISTINCT FROM :active
+                RETURNING active
+            """), {
+                "uid": uid,
+                "account_id": account_id,
+                "active": desired,
+            })
+        ).first()
+        if row and not desired:
+            await AutopostStatusService(session).skip_pending_for_account(
+                uid, account_id
+            )
+        await session.commit()
+    if row is None:
+        await cb.answer("Уже выполнено", show_alert=True)
+        return
+    await _show_menu(cb, account_id=account_id, edit=False)
+
+
 @router.callback_query(F.data == "ac:cap")
 @router.callback_query(F.data.startswith("ac:cap:"))
 async def cb_cap(cb: CallbackQuery, state: FSMContext):
@@ -323,9 +456,19 @@ async def cb_cap(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AcCap.value)
     await state.update_data(account_id=account_id)
     await cb.message.answer(
-        "Сколько постов в день писать автоматом? (1-5)"
+        "Введите количество постов в день: число от 1 до 5.\n"
+        "Для отмены: /cancel"
     )
     await cb.answer()
+
+
+@router.message(AcCap.value, Command("cancel"))
+@router.message(AcTopics.value, Command("cancel"))
+@router.message(AcSlots.value, Command("cancel"))
+@router.message(AcTimezone.value, Command("cancel"))
+async def cancel_setting(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("Ввод отменён. Настройки не изменены.")
 
 
 @router.message(AcCap.value)
@@ -335,9 +478,11 @@ async def cap_value(msg: Message, state: FSMContext):
     except ValueError:
         await msg.answer("Числом, 1-5")
         return
-    data = await state.get_data()
+    scope = await _state_account(msg, state)
+    if scope is None:
+        return
+    uid, account_id = scope
     await state.clear()
-    uid = await _uid(msg.from_user.id)
     async with Session() as session:
         await session.execute(
             text("""
@@ -349,14 +494,14 @@ async def cap_value(msg: Message, state: FSMContext):
             {
                 "posts_per_day": posts_per_day,
                 "uid": uid,
-                "account_id": data["account_id"],
+                "account_id": account_id,
             },
         )
         await session.commit()
     await _answer_schedule_changed(
         msg,
         uid,
-        data["account_id"],
+        account_id,
     )
 
 
@@ -385,21 +530,24 @@ async def cb_topics(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AcTopics.value)
     await state.update_data(account_id=account_id)
     await cb.message.answer(
-        "📝 Темы для автопостинга. Пришли список, каждая тема "
+        "📝 Темы Автопилота. Отправьте список: каждая тема "
         "с новой строки.\n\n"
         f"Сейчас:\n{shown}\n\n"
-        "Пришли новый список или «-», чтобы очистить."
+        "Отправьте новый список или «-», чтобы очистить.\n"
+        "Для отмены: /cancel"
     )
     await cb.answer()
 
 
 @router.message(AcTopics.value)
 async def topics_value(msg: Message, state: FSMContext):
-    data = await state.get_data()
-    await state.clear()
     raw = (msg.text or "").strip()
     topics = "" if raw == "-" else raw
-    uid = await _uid(msg.from_user.id)
+    scope = await _state_account(msg, state)
+    if scope is None:
+        return
+    uid, account_id = scope
+    await state.clear()
     async with Session() as session:
         await session.execute(
             text("""
@@ -411,11 +559,11 @@ async def topics_value(msg: Message, state: FSMContext):
             {
                 "topics": topics,
                 "uid": uid,
-                "account_id": data["account_id"],
+                "account_id": account_id,
             },
         )
         await session.commit()
-    await _answer_status(msg, uid, data["account_id"])
+    await _answer_status(msg, uid, account_id)
 
 
 async def _show_schedule(
@@ -452,7 +600,7 @@ async def _show_schedule(
         )],
     ])
     await cb.message.answer(
-        "🕐 Расписание автопостинга\n\n"
+        "🕐 Расписание Автопилота\n\n"
         f"Время: {serialize_slots(status.settings.slots)}\n"
         f"Дни: {days_label}\n"
         f"Часовой пояс: {status.settings.timezone}",
@@ -478,7 +626,8 @@ async def cb_slots(cb: CallbackQuery, state: FSMContext):
     await state.set_state(AcSlots.value)
     await state.update_data(account_id=account_id)
     await cb.message.answer(
-        "Пришли время через запятую. Пример: 09:00,14:30,19:00"
+        "Отправьте время через запятую. Пример: 09:00,14:30,19:00\n"
+        "Для отмены: /cancel"
     )
     await cb.answer()
 
@@ -492,9 +641,11 @@ async def slots_value(msg: Message, state: FSMContext):
     if not slots:
         await msg.answer("Не понял. Пример: 09:00,14:30,19:00")
         return
-    data = await state.get_data()
+    scope = await _state_account(msg, state)
+    if scope is None:
+        return
+    uid, account_id = scope
     await state.clear()
-    uid = await _uid(msg.from_user.id)
     serialized = serialize_slots(slots)
     async with Session() as session:
         await session.execute(
@@ -507,14 +658,14 @@ async def slots_value(msg: Message, state: FSMContext):
             {
                 "slots": serialized,
                 "uid": uid,
-                "account_id": data["account_id"],
+                "account_id": account_id,
             },
         )
         await session.commit()
     await _answer_schedule_changed(
         msg,
         uid,
-        data["account_id"],
+        account_id,
     )
 
 
@@ -564,13 +715,16 @@ async def cb_days(cb: CallbackQuery):
 
 @router.callback_query(F.data.startswith("ac:timezone:"))
 async def cb_timezone(cb: CallbackQuery, state: FSMContext):
+    uid = await _uid(cb.from_user.id)
+    account_id = await _resolved_account_id(uid, cb.data)
+    if account_id is None:
+        await cb.answer("Threads-аккаунт не найден", show_alert=True)
+        return
     await state.set_state(AcTimezone.value)
-    await state.update_data(
-        account_id=_account_callback_id(cb.data),
-    )
+    await state.update_data(account_id=account_id)
     await cb.message.answer(
-        "Пришли часовой пояс IANA. Например: Europe/Moscow, "
-        "Europe/Berlin или Asia/Almaty"
+        "Отправьте часовой пояс IANA. Например: Europe/Moscow, "
+        "Europe/Berlin или Asia/Almaty.\nДля отмены: /cancel"
     )
     await cb.answer()
 
@@ -585,9 +739,11 @@ async def timezone_value(msg: Message, state: FSMContext):
             f"Неизвестный часовой пояс. Пример: {DEFAULT_TIMEZONE}"
         )
         return
-    data = await state.get_data()
+    scope = await _state_account(msg, state)
+    if scope is None:
+        return
+    uid, account_id = scope
     await state.clear()
-    uid = await _uid(msg.from_user.id)
     async with Session() as session:
         await session.execute(
             text("""
@@ -599,14 +755,14 @@ async def timezone_value(msg: Message, state: FSMContext):
             {
                 "timezone": timezone_name,
                 "uid": uid,
-                "account_id": data["account_id"],
+                "account_id": account_id,
             },
         )
         await session.commit()
     await _answer_schedule_changed(
         msg,
         uid,
-        data["account_id"],
+        account_id,
     )
 
 
@@ -656,7 +812,7 @@ async def cb_goal(cb: CallbackQuery):
         callback_data=f"ac:menu:{account_id}",
     )])
     await cb.message.answer(
-        "🎯 Цель автопостинга\n\n"
+        "🎯 Цель Автопилота\n\n"
         f"Сейчас: {current or 'не задана'}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )

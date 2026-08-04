@@ -205,7 +205,7 @@ def test_schedule_without_slots_has_no_next_run():
 
 def test_enabled_telegram_status_shows_next_and_account():
     rendered = render_status(make_status(), now=NOW)
-    assert "Статус: 🟢 Работает" in rendered
+    assert "Статус: 🟢 Включён" in rendered
     assert "Аккаунт: @creator" in rendered
     assert "Сегодня, 17:14" in rendered
     assert "через 2 ч 14 мин" in rendered
@@ -237,9 +237,9 @@ def test_menu_has_required_enabled_and_disabled_controls():
     ]
     assert "⏸ Остановить" in enabled_labels
     assert "📋 Очередь" in enabled_labels
-    assert "📋 История" in enabled_labels
-    assert "🔄 Обновить статус" in enabled_labels
-    assert "▶️ Включить автопостинг" in disabled_labels
+    assert "🕘 История" in enabled_labels
+    assert "⚙️ Настройки" in enabled_labels
+    assert "▶️ Включить Автопилот" in disabled_labels
 
 
 def test_menu_exposes_each_connected_account():

@@ -73,6 +73,20 @@ from app.schemas.social_brain import (
     BrainRecord,
     BrainTaskContext,
 )
+from app.schemas.ux import (
+    ActivityItem,
+    BrainRecommendation,
+    DashboardAnalytics,
+    DashboardAutopilot,
+    DashboardBalance,
+    DashboardData,
+    DashboardNeuro,
+    DashboardRadar,
+    InterfaceMode,
+    OnboardingProgress,
+    OnboardingStatus,
+    UserUXPreferences,
+)
 
 __all__ = [
     "AccountMutationResult",
@@ -133,4 +147,16 @@ __all__ = [
     "BrainPattern",
     "BrainRecord",
     "BrainTaskContext",
+    "ActivityItem",
+    "BrainRecommendation",
+    "DashboardAnalytics",
+    "DashboardAutopilot",
+    "DashboardBalance",
+    "DashboardData",
+    "DashboardNeuro",
+    "DashboardRadar",
+    "InterfaceMode",
+    "OnboardingProgress",
+    "OnboardingStatus",
+    "UserUXPreferences",
 ]

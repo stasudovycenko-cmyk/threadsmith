@@ -546,12 +546,96 @@ class AnalyticsRepository:
             """), {"user_id": user_id, "account_id": account_id})
         ).mappings().first()
 
+    async def period_overview(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        days: int | None,
+    ) -> Mapping[str, Any]:
+        return (
+            await self.session.execute(text("""
+                WITH period AS (
+                  SELECT *
+                  FROM analytics_post_summary
+                  WHERE user_id = :user_id
+                    AND threads_account_id = :account_id
+                    AND (
+                      CAST(:days AS integer) IS NULL
+                      OR published_at >= now() - make_interval(
+                        days => CAST(:days AS integer)
+                      )
+                    )
+                )
+                SELECT
+                  count(*) AS posts_total,
+                  sum(current_views) AS views_total,
+                  sum(likes) AS likes_total,
+                  sum(replies) AS comments_total,
+                  avg(engagement_rate) AS avg_er,
+                  avg(current_views) AS avg_views,
+                  avg(brain_score) AS brain_score,
+                  count(profile_visits) AS profile_visits_coverage,
+                  (array_agg(period.threads_post_id ORDER BY
+                    period.performance_score DESC NULLS LAST, period.id))[1]
+                    AS best_post_id,
+                  (array_agg(left(source.text, 80) ORDER BY
+                    period.performance_score DESC NULLS LAST, period.id))[1]
+                    AS best_post_preview,
+                  (SELECT candidate.publish_hour
+                   FROM period candidate
+                   WHERE candidate.publish_hour IS NOT NULL
+                   GROUP BY candidate.publish_hour
+                   ORDER BY avg(candidate.brain_score) DESC NULLS LAST,
+                            count(*) DESC, candidate.publish_hour
+                   LIMIT 1) AS best_hour,
+                  (SELECT candidate.weekday
+                   FROM period candidate
+                   WHERE candidate.weekday IS NOT NULL
+                   GROUP BY candidate.weekday
+                   ORDER BY avg(candidate.brain_score) DESC NULLS LAST,
+                            count(*) DESC, candidate.weekday
+                   LIMIT 1) AS best_weekday,
+                  (SELECT candidate.topic
+                   FROM period candidate
+                   WHERE candidate.topic IS NOT NULL
+                   GROUP BY candidate.topic
+                   ORDER BY avg(candidate.brain_score) DESC NULLS LAST,
+                            count(*) DESC, candidate.topic
+                   LIMIT 1) AS best_topic,
+                  (SELECT candidate.hook_type
+                   FROM period candidate
+                   WHERE candidate.hook_type IS NOT NULL
+                   GROUP BY candidate.hook_type
+                   ORDER BY avg(candidate.brain_score) DESC NULLS LAST,
+                            count(*) DESC, candidate.hook_type
+                   LIMIT 1) AS best_hook,
+                  (SELECT candidate.cta_type
+                   FROM period candidate
+                   WHERE candidate.cta_type IS NOT NULL
+                   GROUP BY candidate.cta_type
+                   ORDER BY avg(candidate.brain_score) DESC NULLS LAST,
+                            count(*) DESC, candidate.cta_type
+                   LIMIT 1) AS best_cta
+                FROM period
+                LEFT JOIN scheduled_posts source
+                  ON source.id = period.scheduled_post_id
+                 AND source.user_id = period.user_id
+                 AND source.threads_account_id = period.threads_account_id
+            """), {
+                "user_id": user_id,
+                "account_id": account_id,
+                "days": days,
+            })
+        ).mappings().first() or {}
+
     async def top_posts(
         self,
         user_id: int,
         account_id: int,
         *,
         limit: int = 10,
+        days: int | None = None,
     ) -> list[Mapping[str, Any]]:
         return list((
             await self.session.execute(text("""
@@ -560,6 +644,12 @@ class AnalyticsRepository:
                 FROM analytics_post_summary
                 WHERE user_id = :user_id
                   AND threads_account_id = :account_id
+                  AND (
+                    CAST(:days AS integer) IS NULL
+                    OR published_at >= now() - make_interval(
+                      days => CAST(:days AS integer)
+                    )
+                  )
                 ORDER BY current_views DESC NULLS LAST,
                          engagement_rate DESC NULLS LAST
                 LIMIT :post_limit
@@ -567,6 +657,7 @@ class AnalyticsRepository:
                 "user_id": user_id,
                 "account_id": account_id,
                 "post_limit": limit,
+                "days": days,
             })
         ).mappings().all())
 
@@ -577,7 +668,47 @@ class AnalyticsRepository:
         dimension: str,
         *,
         limit: int = 10,
+        days: int | None = None,
     ) -> list[Mapping[str, Any]]:
+        if days is not None:
+            columns = {
+                "topic": "topic",
+                "hook_type": "hook_type",
+                "cta_type": "cta_type",
+                "publish_hour": "publish_hour::text",
+                "weekday": "weekday::text",
+            }
+            column = columns.get(dimension)
+            if column is None:
+                raise ValueError("Unsupported analytics dimension")
+            return list((
+                await self.session.execute(text(f"""
+                    SELECT {column} AS dimension_key,
+                           count(*) AS posts_count,
+                           avg(current_views) AS avg_views,
+                           avg(engagement_rate) AS avg_er,
+                           avg(replies) AS avg_replies,
+                           avg(brain_score) AS avg_brain_score,
+                           avg(virality_score) AS avg_virality_score,
+                           NULL::numeric AS avg_ctr
+                    FROM analytics_post_summary
+                    WHERE user_id = :user_id
+                      AND threads_account_id = :account_id
+                      AND published_at >= now() - make_interval(
+                        days => CAST(:days AS integer)
+                      )
+                      AND {column} IS NOT NULL
+                    GROUP BY {column}
+                    ORDER BY avg_brain_score DESC NULLS LAST,
+                             posts_count DESC, dimension_key
+                    LIMIT :row_limit
+                """), {
+                    "user_id": user_id,
+                    "account_id": account_id,
+                    "days": days,
+                    "row_limit": limit,
+                })
+            ).mappings().all())
         return list((
             await self.session.execute(text("""
                 SELECT dimension_key, posts_count, avg_views, avg_er,
