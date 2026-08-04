@@ -1,5 +1,6 @@
 """Read-only aggregation for the account Dashboard."""
 
+import json
 import logging
 from collections.abc import Mapping
 from typing import Any
@@ -13,6 +14,7 @@ from app.schemas.ux import (
     DashboardAutopilot,
     DashboardBalance,
     DashboardData,
+    DashboardIntelligence,
     DashboardNeuro,
     DashboardRadar,
     InterfaceMode,
@@ -146,6 +148,19 @@ class DashboardService:
             user_id,
             account.id,
         )
+        intelligence = await self._block(
+            "autopilot_intelligence",
+            """
+            SELECT id, status, health_score,
+                   result_json, created_at
+            FROM decision_runs
+            WHERE user_id = :user_id
+              AND threads_account_id = :account_id
+            ORDER BY created_at DESC, id DESC LIMIT 1
+            """,
+            user_id,
+            account.id,
+        )
         return DashboardData(
             user_id=user_id,
             account_id=account.id,
@@ -157,6 +172,7 @@ class DashboardService:
             neuro=self._neuro(neuro),
             analytics=self._analytics(analytics),
             balance=self._balance(balance),
+            intelligence=self._intelligence(intelligence),
         )
 
     async def _block(
@@ -264,4 +280,36 @@ class DashboardService:
         return DashboardBalance(
             credits=int(row.get("credits_balance") or 0),
             plan=str(row.get("plan") or "free"),
+        )
+
+    @staticmethod
+    def _intelligence(
+        row: Mapping[str, Any] | None,
+    ) -> DashboardIntelligence:
+        if row is None:
+            return DashboardIntelligence(
+                available=False,
+                warning="Рекомендация пока рассчитывается.",
+            )
+        payload = row.get("result_json")
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                payload = {}
+        if not isinstance(payload, Mapping):
+            payload = {}
+        return DashboardIntelligence(
+            available=True,
+            run_id=int(row["id"]),
+            status=str(row.get("status") or "attention"),
+            health_score=int(row.get("health_score") or 0),
+            human_message=str(
+                payload.get("human_message")
+                or "Состояние аккаунта изменилось."
+            ),
+            safe_action=str(payload.get("safe_action") or "NONE"),
+            created_at=row.get("created_at"),
         )

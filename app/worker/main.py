@@ -14,6 +14,7 @@ from app.core.db import Session
 from app.core.threads_api import refresh_long_lived
 from app.worker.autocontent import autocontent_planner
 from app.worker.analytics_jobs import analytics_collector
+from app.worker.autopilot_intelligence_jobs import autopilot_intelligence_job
 from app.worker.feedback_jobs import feedback_loop_job
 from app.worker.m1_jobs import library_crawler
 from app.worker.m3_jobs import comment_poller, publisher
@@ -101,6 +102,12 @@ def build_scheduler() -> AsyncIOScheduler:
         minutes=5,
     )
     scheduler.add_job(analytics_collector, "interval", minutes=30)
+    scheduler.add_job(
+        autopilot_intelligence_job,
+        "interval",
+        minutes=15,
+        next_run_time=datetime.now(timezone.utc),
+    )
     scheduler.add_job(
         feedback_loop_job,
         "cron",

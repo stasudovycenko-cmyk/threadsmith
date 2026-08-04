@@ -136,6 +136,10 @@ def dashboard_keyboard(
             InlineKeyboardButton(text="✍️ Автопилот", callback_data="ac:menu"),
             InlineKeyboardButton(text="📈 Аналитика", callback_data="an:menu"),
         ],
+        [InlineKeyboardButton(
+            text="🧭 Почему Автопилот так решил",
+            callback_data="intel:why",
+        )],
     ]
     if mode == "advanced":
         rows.append([
@@ -176,7 +180,12 @@ def settings_keyboard(mode: InterfaceMode) -> InlineKeyboardMarkup:
 
 
 def render_dashboard(data: DashboardData) -> str:
-    visible_blocks = [data.autopilot, data.analytics, data.balance]
+    visible_blocks = [
+        data.autopilot,
+        data.analytics,
+        data.balance,
+        data.intelligence,
+    ]
     if data.interface_mode == "advanced":
         visible_blocks.extend([data.radar, data.neuro])
     warnings = sum(not block.available for block in visible_blocks)
@@ -203,6 +212,23 @@ def render_dashboard(data: DashboardData) -> str:
         ])
     else:
         lines.append(auto.warning or "Статус временно недоступен.")
+    decision = data.intelligence
+    lines.extend(["", "🧭 Что рекомендует Автопилот"])
+    if decision.available:
+        icons = {
+            "healthy": "🟢",
+            "attention": "⚠️",
+            "blocked": "❌",
+            "waiting": "🟡",
+            "insufficient_data": "📊",
+        }
+        lines.extend([
+            f"{icons.get(decision.status or '', '🟡')} "
+            f"{decision.human_message or 'Состояние аккаунта изменилось.'}",
+            f"Оценка состояния: {decision.health_score or 0} из 100",
+        ])
+    else:
+        lines.append(decision.warning or "Рекомендация пока рассчитывается.")
     if data.interface_mode == "advanced":
         lines.extend(["", "🎯 Radar"])
         if data.radar.available:
@@ -244,6 +270,7 @@ def render_dashboard(data: DashboardData) -> str:
         ])
     elif data.analytics.available:
         lines.append("Пока недостаточно статистики.")
+        lines.append("Для накопления данных продолжайте публикации.")
     else:
         lines.append(data.analytics.warning or "Статус временно недоступен.")
     lines.extend([
@@ -257,13 +284,6 @@ def render_dashboard(data: DashboardData) -> str:
         ])
     else:
         lines.append(data.balance.warning or "Баланс временно недоступен.")
-    lines.append("")
-    if not auto.enabled:
-        lines.append("Следующий шаг: настройте и включите Автопилот.")
-    elif not data.analytics.posts_30d:
-        lines.append("Следующий шаг: продолжайте публикации для аналитики.")
-    else:
-        lines.append("Следующий шаг: откройте Аналитику и рекомендации Brain.")
     return "\n".join(lines)
 
 
