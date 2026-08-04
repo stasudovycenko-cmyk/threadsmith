@@ -75,6 +75,17 @@ class DashboardBalance(UXModel):
     warning: str | None = None
 
 
+class DashboardIntelligence(UXModel):
+    available: bool = False
+    run_id: int | None = None
+    status: str | None = None
+    health_score: int | None = Field(default=None, ge=0, le=100)
+    human_message: str | None = None
+    safe_action: str | None = None
+    created_at: datetime | None = None
+    warning: str | None = None
+
+
 class DashboardData(UXModel):
     user_id: int
     account_id: int
@@ -86,6 +97,9 @@ class DashboardData(UXModel):
     neuro: DashboardNeuro = Field(default_factory=DashboardNeuro)
     analytics: DashboardAnalytics = Field(default_factory=DashboardAnalytics)
     balance: DashboardBalance = Field(default_factory=DashboardBalance)
+    intelligence: DashboardIntelligence = Field(
+        default_factory=DashboardIntelligence
+    )
 
 
 class ActivityItem(UXModel):

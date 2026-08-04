@@ -217,6 +217,10 @@ def _menu_kb(status, accounts) -> InlineKeyboardMarkup:
             callback_data=f"ac:settings:{account_id}",
         )],
         [InlineKeyboardButton(
+            text="🧭 Почему Автопилот так решил",
+            callback_data="intel:why",
+        )],
+        [InlineKeyboardButton(
             text="ℹ️ Как это работает",
             callback_data="help:autopilot",
         )],
