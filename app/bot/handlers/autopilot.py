@@ -181,8 +181,14 @@ async def sch_when(msg: Message, state: FSMContext):
 
     async with Session() as s:
         await s.execute(text("""
-            INSERT INTO scheduled_posts (user_id, threads_account_id, text, link, run_at)
-            VALUES (:uid, :acc, :body, :link, :run)
+            INSERT INTO scheduled_posts (
+              user_id, threads_account_id, text, link, run_at,
+              content_metadata
+            )
+            VALUES (
+              :uid, :acc, :body, :link, :run,
+              '{"source":"manual"}'::jsonb
+            )
         """), {"uid": uid, "acc": acc, "body": data["body"],
                "link": data.get("link"), "run": run_at})
         await s.commit()

@@ -46,7 +46,7 @@ SAFE_ERROR_MESSAGES: dict[AutopostErrorCode, str] = {
     "INSUFFICIENT_CREDITS": "Недостаточно кредитов",
     "GENERATION_FAILED": "Ошибка генерации поста",
     "QUALITY_FAILED": "Пост не прошёл проверку качества",
-    "UNKNOWN_ERROR": "Неизвестная ошибка автопостинга",
+    "UNKNOWN_ERROR": "Не удалось завершить работу Автопилота",
 }
 
 _ACCOUNT_SETTINGS_SQL = text("""
@@ -1481,7 +1481,7 @@ async def recover_autopost_state(
                 "publish_cutoff": publish_cutoff,
                 "message": (
                     "Состояние публикации не подтверждено после "
-                    "перезапуска worker"
+                    "технического перезапуска"
                 ),
             },
         )
@@ -1527,7 +1527,7 @@ async def recover_autopost_state(
             {
                 "now": current,
                 "cutoff": cutoff,
-                "message": "Пропущено после перезапуска worker",
+                "message": "Публикация пропущена после технического перезапуска",
             },
         )
     ).all()
@@ -1712,7 +1712,7 @@ def render_history(
 def render_queue_summary(summary: AutopostQueueSummary) -> str:
     """Render the account-local automatic queue overview."""
     lines = [
-        "📋 Очередь автопостинга",
+        "📋 Очередь Автопилота",
         "",
         f"Аккаунт: @{summary.account.username or summary.account.id}",
         f"Постов в день: {summary.settings.posts_per_day}",
@@ -1777,11 +1777,11 @@ def render_clear_result(result: AutopostQueueClearResult) -> str:
         "Возвращено кредитов: 0",
     ]
     if result.autoposting_disabled:
-        lines.extend(["", "Автопостинг выключен."])
+        lines.extend(["", "Автопилот выключен."])
     else:
         lines.extend([
             "",
-            "Автопостинг остаётся включён, поэтому planner снова "
-            "начнёт создавать новые посты.",
+            "Автопилот остаётся включён и снова начнёт создавать "
+            "новые посты.",
         ])
     return "\n".join(lines)

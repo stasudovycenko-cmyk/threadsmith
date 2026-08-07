@@ -108,8 +108,8 @@ def _render(row: Mapping[str, Any]) -> ActivityItem:
         "comment_published": "Комментарий опубликован",
         "author_replied": "Автор ответил",
         "POST_PERFORMANCE_UPDATED": "Аналитика обновилась",
-        "feedback_rebuilt": "Brain обновил стратегию",
-        "strategy_updated": "Brain обновил стратегию",
+        "feedback_rebuilt": "Автопилот обновил рекомендации",
+        "strategy_updated": "Автопилот обновил рекомендации",
         "account_reconnected": "Аккаунт переподключён",
         "settings_changed": "Настройки изменены",
     }

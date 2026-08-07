@@ -699,7 +699,7 @@ def test_dashboard_and_explanation_are_russian_and_non_technical():
     decision = run()
     rendered = render_explanation(decision)
     assert "Почему Автопилот так решил" in rendered
-    assert "Оценка: 100 из 100" in rendered
+    assert "Состояние аккаунта: <b>100/100</b>" in rendered
     assert "Следующий шаг" in rendered
     assert "SYSTEM_HEALTHY" not in rendered
     dashboard = DashboardData(
@@ -718,7 +718,7 @@ def test_dashboard_and_explanation_are_russian_and_non_technical():
     )
     dashboard_text = render_dashboard(dashboard)
     assert "Что рекомендует Автопилот" in dashboard_text
-    assert "Оценка состояния: 100 из 100" in dashboard_text
+    assert "Состояние аккаунта: <b>100/100</b>" in dashboard_text
 
 
 def test_dashboard_without_decision_has_safe_fallback():

@@ -23,10 +23,12 @@ from app.core.crypto import decrypt_token
 from app.core.db import Session
 from app.core.llm import LLMError, LLMGuardError
 from app.bot.ux import (
+    escape_html,
     format_local_time,
     format_number,
     navigation_row,
     render_error,
+    show_ui_screen,
 )
 
 log = logging.getLogger("radar_bot")
@@ -133,10 +135,14 @@ async def cb_menu(cb: CallbackQuery):
         "failed": "🟡 Последний поиск не завершён",
     }
     lines = [
-        "🎯 Radar",
+        "🔎 <b>Radar</b>",
         "",
-        f"Аккаунт: @{account.username or account.id}",
-        f"Статус: {status_labels.get(last_status, '⚪ Первый поиск ещё не запускался')}",
+        f"<b>Аккаунт: @{escape_html(account.username or account.id)}</b>",
+        "Статус: <b>"
+        + escape_html(status_labels.get(
+            last_status, "⚪ Первый поиск ещё не запускался"
+        ))
+        + "</b>",
         "",
         "Ищет публичные обсуждения по вашей теме, где можно оставить "
         "полезный комментарий и получить новые просмотры.",
@@ -152,11 +158,14 @@ async def cb_menu(cb: CallbackQuery):
         "Лучшая оценка: "
         + (str(best_score) if best_score is not None else "нет данных"),
         "",
-        f"Тема: {niche or 'не задана'}",
-        f"Ключевые слова: {keyword_text}",
-        f"Язык: {'русский' if language == 'ru' else language}",
+        f"Тема: <b>{escape_html(niche or 'не задана')}</b>",
+        f"Ключевые слова: <b>{escape_html(keyword_text)}</b>",
+        "Язык: " + escape_html(
+            "русский" if language == "ru" else (language or "не указан")
+        ),
     ]
-    await cb.message.answer(
+    await show_ui_screen(
+        cb.message,
         "\n".join(lines),
         reply_markup=radar_kb(),
     )

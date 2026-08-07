@@ -4,7 +4,6 @@ import logging
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,7 +25,7 @@ from app.core.autopost_status import (
     serialize_slots,
 )
 from app.core.db import Session
-from app.bot.ux import navigation_row
+from app.bot.ux import escape_html, navigation_row, show_ui_screen
 
 log = logging.getLogger("autocontent_ui")
 router = Router()
@@ -217,7 +216,7 @@ def _menu_kb(status, accounts) -> InlineKeyboardMarkup:
             callback_data=f"ac:settings:{account_id}",
         )],
         [InlineKeyboardButton(
-            text="🧭 Почему Автопилот так решил",
+            text="💡 Почему так?",
             callback_data="intel:why",
         )],
         [InlineKeyboardButton(
@@ -311,14 +310,17 @@ async def _show_menu(
             + "."
         )
     keyboard = _menu_kb(status, accounts)
-    try:
-        if edit:
-            await cb.message.edit_text(message_text, reply_markup=keyboard)
-        else:
-            await cb.message.answer(message_text, reply_markup=keyboard)
-    except TelegramBadRequest as error:
-        if "message is not modified" not in str(error).casefold():
-            raise
+    safe_text = escape_html(message_text).replace(
+        "✍️ Автопилот",
+        "🤖 <b>Автопилот</b>",
+        1,
+    )
+    await show_ui_screen(
+        cb.message,
+        safe_text,
+        reply_markup=keyboard,
+        prefer_edit=True,
+    )
     await cb.answer()
 
 

@@ -8,7 +8,7 @@ from datetime import timezone
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.bot.ux import navigation_row
+from app.bot.ux import escape_html, navigation_row, show_ui_screen
 from app.core.accounts import ThreadsAccountService
 from app.core.autopilot_intelligence.localization import (
     ACTION_LABELS,
@@ -23,17 +23,6 @@ from app.core.db import Session
 router = Router()
 log = logging.getLogger("autopilot_intelligence_bot")
 HISTORY_PAGE_SIZE = 5
-
-_COMPONENT_LABELS = {
-    "token": ("Подключение", 20),
-    "credits": ("Баланс", 15),
-    "queue": ("Очередь", 20),
-    "analytics": ("Статистика", 15),
-    "radar": ("Поиск обсуждений", 10),
-    "neuro": ("Комментарии", 10),
-    "publishing": ("Публикация", 10),
-}
-
 
 async def _selected_account(telegram_id: int):
     async with Session() as session:
@@ -69,34 +58,32 @@ def _safe_target(action: ActionType, account_id: int):
 def render_explanation(run: DecisionRun) -> str:
     result = run.result
     lines = [
-        "🧭 Почему Автопилот так решил",
+        "💡 <b>Почему Автопилот так решил</b>",
         "",
-        f"Состояние: {STATUS_LABELS[result.status]}",
-        f"Оценка: {result.health_score} из 100",
-        "",
-        "Из чего складывается оценка:",
+        f"Состояние аккаунта: <b>{result.health_score}/100</b>",
+        f"Статус: <b>{STATUS_LABELS[result.status]}</b>",
     ]
-    breakdown = result.health_breakdown.model_dump()
-    for key, (label, maximum) in _COMPONENT_LABELS.items():
-        lines.append(f"• {label}: {breakdown[key]} из {maximum}")
-    lines.extend(["", "Причины:"])
-    lines.extend(
-        f"• {reason_message(code)}" for code in result.reason_codes[:8]
-    )
+    positive = [
+        code for code in result.reason_codes
+        if code not in set(result.blockers) | set(result.warnings)
+    ]
+    if positive:
+        lines.extend(["", "<b>Что хорошо</b>"])
+        lines.extend(f"• {reason_message(code)}" for code in positive[:5])
     if result.blockers:
-        lines.extend(["", "Что мешает работе:"])
+        lines.extend(["", "<b>Что мешает работе</b>"])
         lines.extend(
             f"• {reason_message(code)}" for code in result.blockers
         )
     if result.warnings:
-        lines.extend(["", "На что обратить внимание:"])
+        lines.extend(["", "<b>Что стоит улучшить</b>"])
         lines.extend(
             f"• {reason_message(code)}" for code in result.warnings
         )
     lines.extend([
         "",
-        "Следующий шаг:",
-        ACTION_LABELS[result.next_recommended_action],
+        "<b>Что делать сейчас</b>",
+        f"Следующий шаг: {ACTION_LABELS[result.next_recommended_action]}",
         "",
         "Автопилот ничего не изменил автоматически.",
     ])
@@ -114,7 +101,7 @@ def explanation_keyboard(run: DecisionRun) -> InlineKeyboardMarkup:
         )])
     rows.extend([
         [InlineKeyboardButton(
-            text="История решений",
+            text="История рекомендаций",
             callback_data="intel:history:0",
         )],
         navigation_row("home"),
@@ -152,7 +139,8 @@ async def cb_why(cb: CallbackQuery):
             )
             await cb.answer()
             return
-    await cb.message.answer(
+    await show_ui_screen(
+        cb.message,
         render_explanation(run),
         reply_markup=explanation_keyboard(run),
     )
@@ -177,7 +165,7 @@ async def cb_history(cb: CallbackQuery):
             offset=page * HISTORY_PAGE_SIZE,
         )
     visible = runs[:HISTORY_PAGE_SIZE]
-    lines = ["🕘 История решений", ""]
+    lines = ["🕘 История рекомендаций", ""]
     if not visible:
         lines.append("История пока пуста.")
     for run in visible:
@@ -202,8 +190,13 @@ async def cb_history(cb: CallbackQuery):
     if navigation:
         rows.append(navigation)
     rows.append(navigation_row("intel:why"))
-    await cb.message.answer(
-        "\n".join(lines).rstrip(),
+    await show_ui_screen(
+        cb.message,
+        escape_html("\n".join(lines).rstrip()).replace(
+            "🕘 История рекомендаций",
+            "🕘 <b>История рекомендаций</b>",
+            1,
+        ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await cb.answer()

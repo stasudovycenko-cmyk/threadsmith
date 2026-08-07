@@ -223,7 +223,8 @@ def test_clear_result_warns_when_planner_remains_enabled():
     ))
     assert "Удалено будущих постов: 4" in rendered
     assert "Возвращено кредитов: 0" in rendered
-    assert "planner снова начнёт создавать новые посты" in rendered
+    assert "Автопилот остаётся включён" in rendered
+    assert "снова начнёт создавать новые посты" in rendered
 
 
 class FakeResult:

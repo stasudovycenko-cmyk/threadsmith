@@ -20,6 +20,7 @@ from app.bot.handlers.neuro import router as neuro_router
 from app.bot.handlers.onboarding import router as onboarding_router
 from app.bot.handlers.radar import router as radar_router
 from app.bot.handlers.scenarist import router as scenarist_router
+from app.bot.handlers.settings import router as settings_router
 from app.bot.handlers.start import router as start_router
 from app.bot.handlers.menu import router as menu_router
 from app.bot.handlers.voice_settings import router as voice_settings_router
@@ -42,6 +43,7 @@ async def main():
 
     dp.include_router(start_router)
     dp.include_router(dashboard_router)
+    dp.include_router(settings_router)
     dp.include_router(onboarding_router)
     dp.include_router(activity_router)
     dp.include_router(help_router)

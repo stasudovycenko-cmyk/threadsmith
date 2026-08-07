@@ -4,6 +4,7 @@
 """
 from aiogram import F, Router
 from aiogram.filters import CommandStart, CommandObject
+from aiogram.fsm.context import FSMContext
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
 from sqlalchemy import text
@@ -13,7 +14,7 @@ from app.core.config import PLANS
 from app.core.db import Session
 from app.core.robokassa import payment_link
 from app.core.threads_api import auth_link
-from app.bot.handlers.nav import NAV_KB
+from app.bot.handlers.nav import NAV_KB, clear_active_flow
 from app.bot.handlers.dashboard import show_dashboard
 from app.bot.ux import dashboard_keyboard, navigation_row
 
@@ -25,7 +26,12 @@ def main_kb() -> InlineKeyboardMarkup:
 
 
 @router.message(CommandStart())
-async def cmd_start(msg: Message, command: CommandObject):
+async def cmd_start(
+    msg: Message,
+    command: CommandObject,
+    state: FSMContext,
+):
+    await clear_active_flow(msg, state)
     async with Session() as s:
         # рефералка: /start ref_123 -> referred_by = 123 (telegram_id пригласившего)
         ref = None

@@ -17,7 +17,13 @@ from sqlalchemy import text
 from app.core import neuro
 from app.core.accounts import ThreadsAccountService, authorization_status
 from app.core.db import Session
-from app.bot.ux import format_local_time, navigation_row, render_error
+from app.bot.ux import (
+    escape_html,
+    format_local_time,
+    navigation_row,
+    render_error,
+    show_ui_screen,
+)
 
 log = logging.getLogger("neuro_bot")
 router = Router()
@@ -265,15 +271,17 @@ async def cb_menu(cb: CallbackQuery):
         if mode == "auto"
         else ""
     )
-    await cb.message.answer(
-        f"🧠 Neuro для @{account.username or account.id}\n\n"
+    await show_ui_screen(
+        cb.message,
+        "💬 <b>Neuro</b>\n\n"
+        f"<b>Аккаунт: @{escape_html(account.username or account.id)}</b>\n\n"
         "Готовит комментарии к найденным постам. В безопасном режиме "
         "сначала показывает текст вам.\n\n"
-        f"Статус: {'🟢 Включён' if active else '⚪ Выключен'}\n"
-        "Режим: " + (
+        f"Статус: <b>{'🟢 Включён' if active else '⚪ Выключен'}</b>\n"
+        "Режим: <b>" + (
             "Сначала спрашивать меня" if mode == "approve"
             else "Публиковать автоматически"
-        ) + "\n"
+        ) + "</b>\n"
         f"Сегодня опубликовано: {used}\n"
         f"Ждут подтверждения: {pending_count}\n"
         f"Осталось по лимиту: {max(0, cap - used)}\n"

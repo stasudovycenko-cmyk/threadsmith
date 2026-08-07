@@ -27,6 +27,7 @@ from app.core.content_engine import ContentMemoryRepo
 from app.core.config import CREDIT_COSTS
 from app.core.db import Session
 from app.core.llm import LLMError, LLMGuardError
+from app.bot.ux import escape_html, show_ui_screen
 
 log = logging.getLogger("scenarist_bot")
 router = Router()
@@ -175,9 +176,10 @@ async def cb_menu(cb: CallbackQuery):
     uid = await _uid(cb.from_user.id)
     account = await _menu_account(uid) if uid is not None else None
     account_label = f"@{account.username or account.id}" if account else "не подключён"
-    await cb.message.answer(
-        "✍️ Создание контента\n\n"
-        f"Аккаунт: {account_label}\n\n"
+    await show_ui_screen(
+        cb.message,
+        "✍️ <b>Создать пост</b>\n\n"
+        f"<b>Аккаунт: {escape_html(account_label)}</b>\n\n"
         "Выберите, какой текст подготовить:",
         reply_markup=scenarist_kb(),
     )

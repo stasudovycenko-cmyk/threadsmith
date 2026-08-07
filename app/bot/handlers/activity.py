@@ -3,7 +3,12 @@
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.bot.ux import format_local_time, navigation_row
+from app.bot.ux import (
+    escape_html,
+    format_local_time,
+    navigation_row,
+    show_ui_screen,
+)
 from app.core.accounts import ThreadsAccountService
 from app.core.activity import ActivityFeedService
 from app.core.analytics.repository import AnalyticsRepository
@@ -13,17 +18,28 @@ router = Router()
 PAGE_SIZE = 8
 
 
+def _activity_target(data: str) -> tuple[int | None, int]:
+    parts = data.split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[1]), max(0, int(parts[2]))
+        return None, max(0, int(parts[-1]))
+    except (TypeError, ValueError):
+        return None, 0
+
+
 @router.callback_query(F.data.startswith("activity:"))
 async def cb_activity(cb: CallbackQuery):
-    try:
-        page = max(0, int(cb.data.rsplit(":", 1)[-1]))
-    except (TypeError, ValueError):
-        page = 0
+    account_id, page = _activity_target(cb.data)
     async with Session() as session:
         accounts = ThreadsAccountService(session)
         user_id = await accounts.user_id_for_telegram(cb.from_user.id)
         account = (
-            await accounts.selected_account(user_id)
+            await (
+                accounts.get_owned(user_id, account_id)
+                if account_id is not None
+                else accounts.selected_account(user_id)
+            )
             if user_id is not None
             else None
         )
@@ -56,19 +72,28 @@ async def cb_activity(cb: CallbackQuery):
             lines.append(item.detail)
     buttons = []
     paging = []
+    prefix = f"activity:{account.id}:" if account_id is not None else "activity:"
     if page > 0:
         paging.append(InlineKeyboardButton(
-            text="← Новее", callback_data=f"activity:{page - 1}"
+            text="← Новее", callback_data=f"{prefix}{page - 1}"
         ))
     if len(events) == PAGE_SIZE:
         paging.append(InlineKeyboardButton(
-            text="Старее →", callback_data=f"activity:{page + 1}"
+            text="Старее →", callback_data=f"{prefix}{page + 1}"
         ))
     if paging:
         buttons.append(paging)
-    buttons.append(navigation_row("ux:settings"))
-    await cb.message.answer(
-        "\n".join(lines),
+    buttons.append(navigation_row(
+        f"ac:history:{account.id}"
+        if account_id is not None else "ux:settings"
+    ))
+    rendered = escape_html("\n".join(lines)).replace(
+        "📜 Активность", "📜 <b>Активность</b>", 1
+    )
+    await show_ui_screen(
+        cb.message,
+        rendered,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        prefer_edit=account_id is None,
     )
     await cb.answer()

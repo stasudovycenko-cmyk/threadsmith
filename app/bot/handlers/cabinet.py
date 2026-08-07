@@ -28,9 +28,26 @@ from app.core.autopost_status import (
 from app.core.config import PLANS
 from app.core.db import Session
 from app.core.threads_api import auth_link
+from app.bot.ux import escape_html, show_ui_screen
+from app.bot.handlers.dashboard import show_dashboard, show_settings
 
 log = logging.getLogger("account_cabinet")
 router = Router()
+
+
+def _screen_html(value: str) -> str:
+    escaped = escape_html(value)
+    for title in (
+        "👤 Аккаунт и тариф",
+        "👤 Аккаунт",
+        "🔗 Threads-аккаунты",
+        "🔗 Threads-аккаунт",
+    ):
+        icon, label = title.split(" ", 1)
+        escaped = escaped.replace(
+            escape_html(title), f"{icon} <b>{escape_html(label)}</b>", 1
+        )
+    return escaped
 
 
 def _callback_account_id(data: str) -> int | None:
@@ -54,8 +71,8 @@ def _account_name(account) -> str:
 def render_delete_confirmation(account) -> str:
     return (
         f"⚠️ Удалить данные {_account_name(account)}?\n\n"
-        "Удаляются: токен, настройки, очередь, Social Brain, Analytics и "
-        "история публикаций этого аккаунта.\n\n"
+        "Удаляются: подключение, настройки, очередь, данные обучения, "
+        "статистика и история публикаций этого аккаунта.\n\n"
         "Сохраняются: тариф, кредиты пользователя и другие "
         "Threads-аккаунты.\n\n"
         "Потраченные кредиты не возвращаются. Действие необратимо."
@@ -168,8 +185,9 @@ async def cb_cabinet(cb: CallbackQuery):
         ],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="home")],
     ]
-    await cb.message.answer(
-        "\n".join(lines),
+    await show_ui_screen(
+        cb.message,
+        _screen_html("\n".join(lines)),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await cb.answer()
@@ -277,8 +295,9 @@ async def cb_accounts(cb: CallbackQuery):
         )],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="cab:menu")],
     ])
-    await cb.message.answer(
-        "\n".join(lines).rstrip(),
+    await show_ui_screen(
+        cb.message,
+        _screen_html("\n".join(lines).rstrip()),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await cb.answer()
@@ -318,7 +337,11 @@ async def cb_account(cb: CallbackQuery):
                  AND threads_account_id = :account_id),
               (SELECT status FROM ux_onboarding
                WHERE user_id = :user_id
-                 AND threads_account_id = :account_id)
+                 AND threads_account_id = :account_id),
+              (SELECT count(*) FROM scheduled_posts
+               WHERE user_id = :user_id
+                 AND threads_account_id = :account_id
+                 AND status IN ('pending', 'publishing'))
         """), {"user_id": user_id, "account_id": account_id})).first()
     current = datetime.now(timezone.utc)
     auth_state = authorization_status(account, now=current)
@@ -327,7 +350,7 @@ async def cb_account(cb: CallbackQuery):
         (ensure_aware(account.expires_at) - current).days,
     )
     lines = [
-        "🔗 Threads-аккаунт",
+        "👤 Аккаунт",
         "",
         f"Аккаунт: {_account_name(account)}",
         "Статус: " + (
@@ -344,6 +367,7 @@ async def cb_account(cb: CallbackQuery):
             "Автопилот: " + (
                 "🟢 включён" if status.settings.enabled else "⚪ выключен"
             ),
+            f"В очереди: {int(extra[5] or 0) if extra else 0}",
             f"Постов в день: {status.settings.posts_per_day}",
             "Следующий пост: " + (
                 format_local_datetime(
@@ -398,7 +422,7 @@ async def cb_account(cb: CallbackQuery):
             )],
             [
                 InlineKeyboardButton(
-                    text="✍️ Автопилот",
+                    text="🤖 Автопилот",
                     callback_data=f"cab:autopilot:{account.id}",
                 ),
                 InlineKeyboardButton(
@@ -406,6 +430,10 @@ async def cb_account(cb: CallbackQuery):
                     callback_data=f"ap:queue:{account.id}",
                 ),
             ],
+            [InlineKeyboardButton(
+                text="⚙️ Настройки",
+                callback_data=f"cab:settings:{account.id}",
+            )],
         ])
         if not extra or extra[4] not in {"completed", "in_progress"}:
             buttons.append([InlineKeyboardButton(
@@ -424,7 +452,7 @@ async def cb_account(cb: CallbackQuery):
         )])
     if account.connection_status == "connected":
         buttons.append([InlineKeyboardButton(
-            text="🗑 Отключить аккаунт",
+            text="⏸ Отключить аккаунт",
             callback_data=f"cab:disconnect:{account.id}",
         )])
     buttons.extend([
@@ -434,8 +462,9 @@ async def cb_account(cb: CallbackQuery):
         )],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="cab:accounts")],
     ])
-    await cb.message.answer(
-        "\n".join(lines),
+    await show_ui_screen(
+        cb.message,
+        _screen_html("\n".join(lines)),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
     await cb.answer()
@@ -456,10 +485,7 @@ async def cb_select(cb: CallbackQuery):
             await cb.answer("Аккаунт не найден", show_alert=True)
             return
         await session.commit()
-    await cb.message.answer(
-        f"✅ Активным выбран {_account_name(account)}"
-    )
-    await cb.answer()
+    await cb_account(cb)
 
 
 @router.callback_query(F.data.startswith("cab:autopilot:"))
@@ -477,16 +503,9 @@ async def cb_open_autopilot(cb: CallbackQuery):
             await cb.answer("Аккаунт не найден", show_alert=True)
             return
         await session.commit()
-    await cb.message.answer(
-        f"Активный аккаунт: {_account_name(account)}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="🚀 Открыть Автопилот",
-                callback_data="ap:menu",
-            )
-        ]]),
-    )
-    await cb.answer()
+    from app.bot.handlers.autocontent_ui import _show_menu
+
+    await _show_menu(cb, account_id=account.id)
 
 
 @router.callback_query(F.data.startswith("cab:dashboard:"))
@@ -504,12 +523,26 @@ async def cb_open_dashboard(cb: CallbackQuery):
             await cb.answer("Аккаунт не найден", show_alert=True)
             return
         await session.commit()
-    await cb.message.answer(
-        f"Активный аккаунт: {_account_name(account)}",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🏠 Открыть главный экран", callback_data="home")
-        ]]),
-    )
+    await show_dashboard(cb.message, cb.from_user.id)
+    await cb.answer("Аккаунт выбран")
+
+
+@router.callback_query(F.data.startswith("cab:settings:"))
+async def cb_open_settings(cb: CallbackQuery):
+    account_id = _callback_account_id(cb.data)
+    async with Session() as session:
+        service = ThreadsAccountService(session)
+        user_id = await service.user_id_for_telegram(cb.from_user.id)
+        account = (
+            await service.select_account(user_id, account_id)
+            if user_id is not None and account_id is not None
+            else None
+        )
+        if account is None:
+            await cb.answer("Аккаунт не найден", show_alert=True)
+            return
+        await session.commit()
+    await show_settings(cb.message, cb.from_user.id)
     await cb.answer("Аккаунт выбран")
 
 
@@ -613,10 +646,13 @@ async def cb_more(cb: CallbackQuery):
     if account is None:
         await cb.answer("Аккаунт не найден", show_alert=True)
         return
-    await cb.message.answer(
-        f"⚙️ Действия с {_account_name(account)}\n\n"
+    await show_ui_screen(
+        cb.message,
+        _screen_html(
+            f"⚙️ Действия с {_account_name(account)}\n\n"
         "Отключение сохраняет историю. Полное удаление стирает "
-        "данные выбранного аккаунта без возможности восстановления.",
+        "данные выбранного аккаунта без возможности восстановления."
+        ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
                 text="📋 Скопировать настройки",

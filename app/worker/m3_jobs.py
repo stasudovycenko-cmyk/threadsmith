@@ -19,17 +19,54 @@ DO NOTHING RETURNING. Вставилось - отвечаем, нет - уже �
 import logging
 
 from aiogram import Bot
+from aiogram.enums import ParseMode
 from sqlalchemy import text
 
 from app.core import autopilot
 from app.core.config import settings
 from app.core.crypto import decrypt_token
 from app.core.db import Session
+from app.bot.publication_notifications import (
+    publication_keyboard,
+    render_publication_notification,
+)
+from app.core.publication_notifications import PublicationNotificationService
 from app.core.threads_api import (create_container, get_replies,
                                   publish_container)
+from app.schemas.notifications import PublicationOutcome
 
 log = logging.getLogger("m3_jobs")
 _bot = Bot(settings.BOT_TOKEN)
+
+
+async def send_publication_notification(
+    scheduled_post_id: int,
+    outcome: PublicationOutcome,
+) -> bool:
+    try:
+        async with Session() as session:
+            notification = await PublicationNotificationService(
+                session
+            ).claim(scheduled_post_id, outcome)
+            await session.commit()
+        if notification is None:
+            return False
+        await _bot.send_message(
+            notification.telegram_id,
+            render_publication_notification(notification),
+            parse_mode=ParseMode.HTML,
+            reply_markup=publication_keyboard(notification),
+        )
+        return True
+    except Exception as error:
+        log.warning(
+            "publication notification failed post=%s outcome=%s "
+            "error_type=%s",
+            scheduled_post_id,
+            outcome,
+            type(error).__name__,
+        )
+        return False
 
 
 async def publisher():
@@ -39,16 +76,12 @@ async def publisher():
 
     for row in posts:
         async with Session() as s:
-            ok, note = await autopilot.publish_one(s, row)
-            tg = (await s.execute(text(
-                "SELECT telegram_id FROM users WHERE id = :uid"
-            ), {"uid": row[1]})).first()
+            ok, _note = await autopilot.publish_one(s, row)
             await s.commit()
-        if tg:
-            try:
-                await _bot.send_message(tg[0], note)
-            except Exception:
-                pass
+        await send_publication_notification(
+            int(row[0]),
+            "success" if ok else "failed",
+        )
 
 
 async def comment_poller():

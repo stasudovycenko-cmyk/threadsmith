@@ -118,15 +118,15 @@ class DashboardService:
         analytics = await self._block(
             "analytics",
             """
-            SELECT count(post.id) AS posts_30d,
-                   sum(post.current_views) AS views_30d,
-                   avg(post.engagement_rate) AS avg_er,
+            SELECT count(post.id) AS posts_7d,
+                   sum(post.current_views) AS views_7d,
+                   avg(post.engagement_rate) AS avg_er_7d,
                    summary.brain_score
             FROM (SELECT 1) seed
             LEFT JOIN analytics_post_summary post
               ON post.user_id = :user_id
              AND post.threads_account_id = :account_id
-             AND post.published_at >= now() - interval '30 days'
+             AND post.published_at >= now() - interval '7 days'
             LEFT JOIN analytics_account_summary summary
               ON summary.user_id = :user_id
              AND summary.threads_account_id = :account_id
@@ -250,19 +250,20 @@ class DashboardService:
                 available=False,
                 warning="Аналитика временно недоступна.",
             )
-        posts = int(row.get("posts_30d") or 0)
+        posts = int(row.get("posts_7d") or row.get("posts_30d") or 0)
+        views = row.get("views_7d")
+        if views is None:
+            views = row.get("views_30d")
+        avg_er = row.get("avg_er_7d")
+        if avg_er is None:
+            avg_er = row.get("avg_er")
         return DashboardAnalytics(
+            posts_7d=posts,
+            views_7d=int(views) if views is not None else None,
+            avg_er_7d=float(avg_er) if avg_er is not None else None,
             posts_30d=posts,
-            views_30d=(
-                int(row["views_30d"])
-                if row.get("views_30d") is not None
-                else None
-            ),
-            avg_er=(
-                float(row["avg_er"])
-                if row.get("avg_er") is not None
-                else None
-            ),
+            views_30d=int(views) if views is not None else None,
+            avg_er=float(avg_er) if avg_er is not None else None,
             brain_score=(
                 float(row["brain_score"])
                 if row.get("brain_score") is not None

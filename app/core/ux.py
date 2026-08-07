@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.brain_repo import BrainRepo
 from app.schemas.ux import (
+    AccountUXSettings,
     InterfaceMode,
     OnboardingProgress,
     OnboardingStatus,
@@ -25,6 +26,23 @@ def _json_object(value: Any) -> dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def normalize_text_list(value: Any, *, limit: int = 20) -> list[str]:
+    if isinstance(value, str):
+        values = value.replace("\n", ",").split(",")
+    elif isinstance(value, (list, tuple)):
+        values = value
+    else:
+        values = []
+    result = []
+    for item in values:
+        compact = str(item).strip()
+        if compact and compact not in result:
+            result.append(compact)
+        if len(result) >= limit:
+            break
+    return result
 
 
 class UXService:
@@ -62,6 +80,201 @@ class UXService:
             await self.preferences(user_id)
             return await self.set_mode(user_id, mode)
         return UserUXPreferences.model_validate(dict(row))
+
+    async def account_settings(
+        self,
+        user_id: int,
+        account_id: int,
+    ) -> AccountUXSettings | None:
+        row = (
+            await self.session.execute(text("""
+                SELECT account.user_id, account.id AS threads_account_id,
+                       coalesce(account.username, account.id::text) AS username,
+                       setting.topics, setting.timezone, setting.active,
+                       setting.publish_notifications_enabled,
+                       coalesce(radar.keywords, '{}'::text[]) AS radar_keywords
+                FROM threads_accounts account
+                JOIN autocontent_settings setting
+                  ON setting.threads_account_id = account.id
+                 AND setting.user_id = account.user_id
+                LEFT JOIN radar_settings radar
+                  ON radar.threads_account_id = account.id
+                 AND radar.user_id = account.user_id
+                WHERE account.user_id = :user_id
+                  AND account.id = :account_id
+            """), {"user_id": user_id, "account_id": account_id})
+        ).mappings().first()
+        if row is None:
+            return None
+        brain = await BrainRepo(self.session).get_or_create(user_id, account_id)
+        dna = dict(brain.dna)
+        voice = _json_object(dna.get("voice"))
+        examples = normalize_text_list(
+            dna.get("recent_examples")
+            or dna.get("style_examples")
+            or voice.get("sample_phrases"),
+            limit=10,
+        )
+        return AccountUXSettings(
+            user_id=user_id,
+            threads_account_id=account_id,
+            username=str(row["username"]),
+            manual_style=(
+                str(
+                    voice.get("manual_style")
+                    or voice.get("tone")
+                    or voice.get("summary")
+                ).strip()
+                if (
+                    voice.get("manual_style")
+                    or voice.get("tone")
+                    or voice.get("summary")
+                )
+                else None
+            ),
+            style_examples=examples,
+            topics=normalize_text_list(row.get("topics")),
+            radar_keywords=normalize_text_list(
+                row.get("radar_keywords"), limit=10
+            ),
+            timezone=str(row.get("timezone") or "Europe/Moscow"),
+            autopilot_enabled=bool(row.get("active")),
+            publish_notifications_enabled=bool(
+                row.get("publish_notifications_enabled", True)
+            ),
+        )
+
+    async def save_manual_style(
+        self,
+        user_id: int,
+        account_id: int,
+        value: str,
+    ) -> bool:
+        compact = value.strip()
+        if not 10 <= len(compact) <= 1500:
+            return False
+        repository = BrainRepo(self.session)
+        brain = await repository.get_or_create(user_id, account_id)
+        dna = dict(brain.dna)
+        voice = _json_object(dna.get("voice"))
+        voice["manual_style"] = compact
+        dna["voice"] = voice
+        await repository.update_section(
+            brain.id,
+            "dna",
+            dna,
+            user_id=user_id,
+            account_id=account_id,
+        )
+        return True
+
+    async def save_style_examples(
+        self,
+        user_id: int,
+        account_id: int,
+        examples: list[str],
+    ) -> bool:
+        compact = [
+            item[:1000]
+            for item in normalize_text_list(examples, limit=10)
+        ]
+        repository = BrainRepo(self.session)
+        brain = await repository.get_or_create(user_id, account_id)
+        dna = dict(brain.dna)
+        if compact:
+            dna["recent_examples"] = compact
+        else:
+            dna.pop("recent_examples", None)
+            dna.pop("style_examples", None)
+        await repository.update_section(
+            brain.id,
+            "dna",
+            dna,
+            user_id=user_id,
+            account_id=account_id,
+        )
+        return True
+
+    async def save_topics(
+        self,
+        user_id: int,
+        account_id: int,
+        topics: list[str],
+    ) -> bool:
+        compact = [
+            item[:300]
+            for item in normalize_text_list(topics, limit=20)
+        ]
+        row = (
+            await self.session.execute(text("""
+                UPDATE autocontent_settings setting
+                SET topics = :topics, updated_at = now()
+                FROM threads_accounts account
+                WHERE setting.user_id = :user_id
+                  AND setting.threads_account_id = :account_id
+                  AND account.id = setting.threads_account_id
+                  AND account.user_id = setting.user_id
+                RETURNING setting.threads_account_id
+            """), {
+                "user_id": user_id,
+                "account_id": account_id,
+                "topics": "\n".join(compact),
+            })
+        ).first()
+        return row is not None
+
+    async def save_radar_keywords(
+        self,
+        user_id: int,
+        account_id: int,
+        keywords: list[str],
+    ) -> bool:
+        compact = [
+            item[:100]
+            for item in normalize_text_list(keywords, limit=10)
+        ]
+        row = (
+            await self.session.execute(text("""
+                UPDATE radar_settings setting
+                SET keywords = :keywords, updated_at = now()
+                FROM threads_accounts account
+                WHERE setting.user_id = :user_id
+                  AND setting.threads_account_id = :account_id
+                  AND account.id = setting.threads_account_id
+                  AND account.user_id = setting.user_id
+                RETURNING setting.threads_account_id
+            """), {
+                "user_id": user_id,
+                "account_id": account_id,
+                "keywords": compact,
+            })
+        ).first()
+        return row is not None
+
+    async def set_publish_notifications(
+        self,
+        user_id: int,
+        account_id: int,
+        enabled: bool,
+    ) -> bool:
+        row = (
+            await self.session.execute(text("""
+                UPDATE autocontent_settings setting
+                SET publish_notifications_enabled = :enabled,
+                    updated_at = now()
+                FROM threads_accounts account
+                WHERE setting.user_id = :user_id
+                  AND setting.threads_account_id = :account_id
+                  AND account.id = setting.threads_account_id
+                  AND account.user_id = setting.user_id
+                RETURNING setting.threads_account_id
+            """), {
+                "user_id": user_id,
+                "account_id": account_id,
+                "enabled": enabled,
+            })
+        ).first()
+        return row is not None
 
     async def onboarding(
         self,

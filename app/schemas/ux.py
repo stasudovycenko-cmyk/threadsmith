@@ -61,6 +61,9 @@ class DashboardNeuro(UXModel):
 
 class DashboardAnalytics(UXModel):
     available: bool = True
+    posts_7d: int | None = None
+    views_7d: int | None = None
+    avg_er_7d: float | None = None
     posts_30d: int | None = None
     views_30d: int | None = None
     avg_er: float | None = None
@@ -100,6 +103,19 @@ class DashboardData(UXModel):
     intelligence: DashboardIntelligence = Field(
         default_factory=DashboardIntelligence
     )
+
+
+class AccountUXSettings(UXModel):
+    user_id: int
+    threads_account_id: int
+    username: str
+    manual_style: str | None = None
+    style_examples: list[str] = Field(default_factory=list, max_length=10)
+    topics: list[str] = Field(default_factory=list)
+    radar_keywords: list[str] = Field(default_factory=list)
+    timezone: str = "Europe/Moscow"
+    autopilot_enabled: bool = False
+    publish_notifications_enabled: bool = True
 
 
 class ActivityItem(UXModel):

@@ -5,9 +5,11 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from app.bot.ux import (
     dashboard_keyboard,
+    escape_html,
     navigation_row,
     render_dashboard,
     settings_keyboard,
+    show_ui_screen,
 )
 from app.core.accounts import ThreadsAccountService
 from app.core.brain_coach import BrainCoachService
@@ -20,28 +22,37 @@ from app.schemas.ux import InterfaceMode
 router = Router()
 
 
-async def show_dashboard(target: Message, telegram_id: int) -> None:
+async def show_dashboard(
+    target: Message,
+    telegram_id: int,
+    *,
+    prefer_edit: bool = True,
+) -> None:
     async with Session() as session:
         accounts = ThreadsAccountService(session)
         user_id = await accounts.user_id_for_telegram(telegram_id)
         if user_id is None:
-            await target.answer(
-                "Сначала нажмите /start.",
+            await show_ui_screen(
+                target,
+                "🏠 <b>Главная</b>\n\nСначала нажмите /start.",
                 reply_markup=dashboard_keyboard("simple", has_account=False),
+                prefer_edit=prefer_edit,
             )
             return
         preferences = await UXService(session).preferences(user_id)
         account = await accounts.selected_account(user_id)
         if account is None:
             await session.commit()
-            await target.answer(
-                "🏠 ThreadFlow\n\n"
+            await show_ui_screen(
+                target,
+                "🏠 <b>Главная</b>\n\n"
                 "Threads-аккаунт пока не подключён.\n\n"
                 "Подключите первый аккаунт, затем настройте его за две минуты.",
                 reply_markup=dashboard_keyboard(
                     preferences.interface_mode,
                     has_account=False,
                 ),
+                prefer_edit=prefer_edit,
             )
             return
         dashboard = await DashboardService(session).load(
@@ -50,40 +61,57 @@ async def show_dashboard(target: Message, telegram_id: int) -> None:
             mode=preferences.interface_mode,
         )
         await session.commit()
-    await target.answer(
+    await show_ui_screen(
+        target,
         render_dashboard(dashboard),
         reply_markup=dashboard_keyboard(preferences.interface_mode),
+        prefer_edit=prefer_edit,
     )
 
 
 @router.callback_query(F.data == "home")
 async def cb_home(cb: CallbackQuery):
-    await show_dashboard(cb.message, cb.from_user.id)
+    await show_dashboard(cb.message, cb.from_user.id, prefer_edit=True)
     await cb.answer()
 
 
 @router.callback_query(F.data == "ux:settings")
 async def cb_settings(cb: CallbackQuery):
+    await show_settings(cb.message, cb.from_user.id)
+    await cb.answer()
+
+
+async def show_settings(target: Message, telegram_id: int) -> None:
     async with Session() as session:
         accounts = ThreadsAccountService(session)
-        user_id = await accounts.user_id_for_telegram(cb.from_user.id)
+        user_id = await accounts.user_id_for_telegram(telegram_id)
         if user_id is None:
-            await cb.answer("Сначала нажмите /start", show_alert=True)
+            await show_ui_screen(
+                target,
+                "⚙️ <b>Настройки аккаунта</b>\n\nСначала нажмите /start.",
+                reply_markup=dashboard_keyboard("simple", has_account=False),
+            )
             return
         preferences = await UXService(session).preferences(user_id)
         account = await accounts.selected_account(user_id)
         await session.commit()
-    account_text = f"@{account.username or account.id}" if account else "не выбран"
+    account_text = (
+        f"@{escape_html(account.username or account.id)}"
+        if account else "не выбран"
+    )
     mode_text = "Простой" if preferences.interface_mode == "simple" else "Продвинутый"
-    await cb.message.answer(
-        "⚙️ Настройки\n\n"
-        f"Аккаунт: {account_text}\n"
-        f"Режим интерфейса: {mode_text}\n\n"
+    await show_ui_screen(
+        target,
+        "⚙️ <b>Настройки аккаунта</b>\n\n"
+        f"<b>Аккаунт: {account_text}</b>\n"
+        f"Режим интерфейса: <b>{mode_text}</b>\n\n"
         "Режим меняет только видимость разделов. Тариф, расписание и "
         "автоматические действия не меняются.",
-        reply_markup=settings_keyboard(preferences.interface_mode),
+        reply_markup=settings_keyboard(
+            preferences.interface_mode,
+            account.id if account else None,
+        ),
     )
-    await cb.answer()
 
 
 @router.callback_query(F.data.startswith("ux:set_mode:"))
@@ -102,12 +130,18 @@ async def cb_set_mode(cb: CallbackQuery):
             user_id,
             mode,
         )
+        account = await service.selected_account(user_id)
         await session.commit()
     label = "Простой" if preferences.interface_mode == "simple" else "Продвинутый"
-    await cb.message.answer(
-        f"Режим изменён: {label}.\n\n"
+    await show_ui_screen(
+        cb.message,
+        f"⚙️ <b>Настройки аккаунта</b>\n\n"
+        f"Режим интерфейса: <b>{label}</b>\n\n"
         "Автоматические действия и тариф не изменились.",
-        reply_markup=settings_keyboard(preferences.interface_mode),
+        reply_markup=settings_keyboard(
+            preferences.interface_mode,
+            account.id if account else None,
+        ),
     )
     await cb.answer("Сохранено")
 

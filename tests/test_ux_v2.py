@@ -123,11 +123,11 @@ def test_dashboard_without_statistics_has_explanatory_empty_state():
 def test_simple_and_advanced_modes_expose_expected_sections():
     simple = _labels(dashboard_keyboard("simple"))
     advanced = _labels(dashboard_keyboard("advanced"))
-    assert "✍️ Автопилот" in simple
-    assert "📈 Аналитика" in simple
+    assert "🤖 Автопилот" in simple
+    assert "📊 Аналитика" in simple
     assert all("Radar" not in label and "Neuro" not in label for label in simple)
-    assert "🎯 Radar" in advanced
-    assert "🧠 Neuro" in advanced
+    assert "🔎 Radar" in advanced
+    assert "💬 Neuro" in advanced
     simple_text = render_dashboard(_dashboard(interface_mode="simple"))
     assert "🎯 Radar" not in simple_text
     assert "🧠 Neuro" not in simple_text

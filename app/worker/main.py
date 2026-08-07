@@ -11,13 +11,18 @@ from sqlalchemy import text
 from app.core.autopost_status import recover_autopost_state
 from app.core.crypto import decrypt_token, encrypt_token
 from app.core.db import Session
+from app.core.publication_notifications import PublicationNotificationService
 from app.core.threads_api import refresh_long_lived
 from app.worker.autocontent import autocontent_planner
 from app.worker.analytics_jobs import analytics_collector
 from app.worker.autopilot_intelligence_jobs import autopilot_intelligence_job
 from app.worker.feedback_jobs import feedback_loop_job
 from app.worker.m1_jobs import library_crawler
-from app.worker.m3_jobs import comment_poller, publisher
+from app.worker.m3_jobs import (
+    comment_poller,
+    publisher,
+    send_publication_notification,
+)
 from app.worker.m4_jobs import neuro_hunter, neuro_reply_poller
 
 logging.basicConfig(level=logging.INFO)
@@ -65,6 +70,13 @@ async def autopost_recovery_job():
     async with Session() as session:
         result = await recover_autopost_state(session)
         await session.commit()
+    if result.get("interrupted"):
+        async with Session() as session:
+            post_ids = await PublicationNotificationService(
+                session
+            ).recovered_unknown_post_ids()
+        for post_id in post_ids:
+            await send_publication_notification(post_id, "unknown")
     if any(result.values()):
         log.warning("autopost recovery result=%s", result)
     return result

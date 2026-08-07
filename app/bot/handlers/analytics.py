@@ -6,7 +6,13 @@ from typing import Any
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
-from app.bot.ux import format_number, format_percent, navigation_row
+from app.bot.ux import (
+    escape_html,
+    format_number,
+    format_percent,
+    navigation_row,
+    show_ui_screen,
+)
 from app.core.accounts import ThreadsAccountService
 from app.core.analytics.repository import AnalyticsRepository
 from app.core.db import Session
@@ -23,6 +29,27 @@ WEEKDAYS = (
 PERIODS = {"7": 7, "30": 30, "90": 90, "all": None}
 
 
+def _text(value: Any, limit: int = 70) -> str:
+    compact = str(value or "").strip()
+    return compact if len(compact) <= limit else compact[:limit].rstrip() + "…"
+
+
+def _screen_html(value: str) -> str:
+    escaped = escape_html(value)
+    for title in (
+        "📈 Аналитика", "🏆 Лучшие посты", "🧩 Темы",
+        "🪝 Начала постов", "📣 Призывы", "🕒 Время публикации",
+        "🧠 Brain Score", "📈 История роста",
+    ):
+        icon, label = title.split(" ", 1)
+        escaped = escaped.replace(
+            escape_html(title),
+            f"{icon} <b>{escape_html(label)}</b>",
+            1,
+        )
+    return escaped
+
+
 def _period_token(days: int | None) -> str:
     return "all" if days is None else str(days)
 
@@ -36,7 +63,11 @@ def _days(data: str, default: int | None = 30) -> int | None:
     return PERIODS.get(token, default)
 
 
-def analytics_kb(days: int | None = 30) -> InlineKeyboardMarkup:
+def analytics_kb(
+    days: int | None = 30,
+    *,
+    detail: bool = False,
+) -> InlineKeyboardMarkup:
     token = _period_token(days)
     period_buttons = []
     for value, label in (("7", "7 дн."), ("30", "30 дн."), ("90", "90 дн."), ("all", "Всё")):
@@ -60,7 +91,7 @@ def analytics_kb(days: int | None = 30) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📈 Рост", callback_data="an:growth"),
         ],
         [InlineKeyboardButton(text="🧠 Brain", callback_data=f"an:brain:{token}")],
-        navigation_row("home"),
+        navigation_row(f"an:overview:{token}" if detail else "home"),
     ])
 
 
@@ -109,12 +140,12 @@ def render_overview(
         f"Средние просмотры: {_number(row.get('avg_views'))}",
         "",
         "Лучший пост: "
-        + str(row.get("best_post_preview") or "пока нет данных"),
+        + _text(row.get("best_post_preview") or "пока нет данных", 160),
         f"Лучшее время: {hour_text}",
         f"Лучший день: {weekday_name}",
-        f"Лучшая тема: {row.get('best_topic') or 'пока нет данных'}",
-        f"Лучшее начало: {row.get('best_hook') or 'пока нет данных'}",
-        f"Лучший призыв: {row.get('best_cta') or 'пока нет данных'}",
+        f"Лучшая тема: {_text(row.get('best_topic') or 'пока нет данных')}",
+        f"Лучшее начало: {_text(row.get('best_hook') or 'пока нет данных')}",
+        f"Лучший призыв: {_text(row.get('best_cta') or 'пока нет данных')}",
         f"Brain Score: {_score(row.get('brain_score'))}",
     ]
     if int(row.get("profile_visits_coverage") or 0) == 0:
@@ -148,8 +179,11 @@ async def _show_overview(cb: CallbackQuery, days: int | None) -> None:
         row = await AnalyticsRepository(session).period_overview(
             user_id, account.id, days=days
         )
-    await cb.message.answer(
-        render_overview(account.username or str(account.id), row, days=days),
+    await show_ui_screen(
+        cb.message,
+        _screen_html(render_overview(
+            account.username or str(account.id), row, days=days
+        )),
         reply_markup=analytics_kb(days),
     )
     await cb.answer()
@@ -192,10 +226,14 @@ async def cb_top(cb: CallbackQuery):
                 "",
                 f"{index}. {_number(row.get('current_views'))} просмотров",
                 f"ER: {_percent(row.get('engagement_rate'))} · {date_text}",
-                f"Тема: {row.get('topic') or 'не определена'}",
+                f"Тема: {_text(row.get('topic') or 'не определена')}",
             ])
         message = "\n".join(lines)
-    await cb.message.answer(message, reply_markup=analytics_kb(days))
+    await show_ui_screen(
+        cb.message,
+        _screen_html(message),
+        reply_markup=analytics_kb(days, detail=True),
+    )
     await cb.answer()
 
 
@@ -206,7 +244,7 @@ def render_dimension(title: str, rows: list[Mapping[str, Any]]) -> str:
     for row in rows:
         lines.extend([
             "",
-            str(row.get("dimension_key")),
+            _text(row.get("dimension_key")),
             f"Постов: {row.get('posts_count')}",
             f"Просмотры: {_number(row.get('avg_views'))}",
             f"ER: {_percent(row.get('avg_er'))}",
@@ -243,7 +281,11 @@ async def cb_dimension(cb: CallbackQuery):
         f"Период: {_period_label(days)}\n\n"
         + render_dimension("Результаты", rows)
     )
-    await cb.message.answer(message, reply_markup=analytics_kb(days))
+    await show_ui_screen(
+        cb.message,
+        _screen_html(message),
+        reply_markup=analytics_kb(days, detail=True),
+    )
     await cb.answer()
 
 
@@ -282,7 +324,11 @@ async def cb_time(cb: CallbackQuery):
             f"{name}: {_number(row.get('avg_views'))} · {_percent(row.get('avg_er'))}"
         )
     message = "\n".join(lines) if hours or weekdays else EMPTY
-    await cb.message.answer(message, reply_markup=analytics_kb(days))
+    await show_ui_screen(
+        cb.message,
+        _screen_html(message),
+        reply_markup=analytics_kb(days, detail=True),
+    )
     await cb.answer()
 
 
@@ -305,7 +351,11 @@ async def cb_brain(cb: CallbackQuery):
         "Brain объединяет качество темы, начала, призыва и реакций. "
         "При небольшой выборке оценка может отсутствовать."
     )
-    await cb.message.answer(message, reply_markup=analytics_kb(days))
+    await show_ui_screen(
+        cb.message,
+        _screen_html(message),
+        reply_markup=analytics_kb(days, detail=True),
+    )
     await cb.answer()
 
 
@@ -325,12 +375,16 @@ async def cb_growth(cb: CallbackQuery):
         for row in rows:
             lines.extend([
                 "",
-                f"Пост {row['threads_post_id']}",
+                f"Пост {_text(row['threads_post_id'], 100)}",
                 f"30 минут: {_number(row.get('30m'))}",
                 f"2 часа: {_number(row.get('2h'))}",
                 f"Сутки: {_number(row.get('24h'))}",
                 f"Неделя: {_number(row.get('7d'))}",
             ])
         message = "\n".join(lines)
-    await cb.message.answer(message, reply_markup=analytics_kb(30))
+    await show_ui_screen(
+        cb.message,
+        _screen_html(message),
+        reply_markup=analytics_kb(30, detail=True),
+    )
     await cb.answer()
