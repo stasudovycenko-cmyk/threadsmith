@@ -376,7 +376,7 @@ def test_run_reservation_is_database_idempotent():
     sql = session.calls[0][0]
     assert "ON CONFLICT DO NOTHING" in sql
     assert "DO NOTHING" in sql
-    assert "AND active" in sql
+    assert "AND setting.active" in sql
 
 
 def test_disabling_skips_future_runs_but_not_publishing():
@@ -544,6 +544,8 @@ class PlannerSession(QueueSession):
             return FakeResult([])
         if "INSERT INTO autopost_runs" in sql:
             return FakeResult([(51,)])
+        if "INSERT INTO ai_credit_events" in sql:
+            return FakeResult([("autocontent:51",)])
         if "INSERT INTO scheduled_posts" in sql:
             return FakeResult([(901,)])
         return FakeResult([])

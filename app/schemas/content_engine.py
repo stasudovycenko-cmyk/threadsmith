@@ -76,8 +76,8 @@ class ContentGenerationDraft(ContentModel):
 
     hooks: list[ContentDraftHook] = Field(min_length=3, max_length=3)
     body: str
-    selected_hook_index: int = Field(ge=0, le=2)
-    specificity: float = Field(ge=0, le=1)
+    selected_hook_index: int = Field(default=0, ge=0, le=2)
+    specificity: float = Field(default=0.5, ge=0, le=1)
 
 
 class ContentMetadata(ContentModel):
@@ -95,6 +95,8 @@ class ContentMetadata(ContentModel):
     selected_hook_index: int = Field(default=0, ge=0, le=2)
     selected_hook: str = ""
     pipeline_stage: Literal["generate", "repair"] = "generate"
+    deterministic_fixes: list[str] = Field(default_factory=list)
+    repair_reasons: list[str] = Field(default_factory=list)
     user_id: int | None = None
     threads_account_id: int | None = None
 

@@ -95,6 +95,7 @@ class BudgetSnapshot:
     run_spend: Decimal = Decimal("0")
     run_calls: int = 0
     account_feature_calls: int = 0
+    account_feature_hour_calls: int = 0
     current_hour_calls: int = 0
     recent_hour_calls: tuple[int, ...] = ()
 
@@ -108,6 +109,7 @@ class ResolvedLimits:
     run_calls: int | None
     account_feature_daily_calls: int | None
     feature_hourly_calls: int
+    account_feature_hourly_calls: int | None = None
 
 
 AI_FEATURE_DAILY_USD_LIMITS: dict[str, Decimal] = {
@@ -144,6 +146,10 @@ AI_RUN_CALL_LIMITS: dict[str, int] = {
 }
 AI_ACCOUNT_FEATURE_DAILY_CALL_LIMITS: dict[str, int] = {
     "neuro_comment": 30,
+}
+AI_ACCOUNT_FEATURE_HOURLY_CALL_LIMITS: dict[str, int] = {
+    "autocontent": 10,
+    "autocontent_repair": 5,
 }
 
 AI_MAX_REPAIR_PER_REQUEST = 1
@@ -280,6 +286,9 @@ def limits_for(feature: str) -> ResolvedLimits:
             feature,
             AI_DEFAULT_FEATURE_HOURLY_CALL_LIMIT,
         ),
+        account_feature_hourly_calls=(
+            AI_ACCOUNT_FEATURE_HOURLY_CALL_LIMITS.get(feature)
+        ),
     )
 
 
@@ -356,6 +365,19 @@ def evaluate_budget(
             scope=f"account:{candidate.threads_account_id}",
             current=snapshot.account_feature_calls,
             limit=limits.account_feature_daily_calls,
+        )
+
+    if (
+        candidate.threads_account_id is not None
+        and limits.account_feature_hourly_calls is not None
+        and snapshot.account_feature_hour_calls + 1
+        > limits.account_feature_hourly_calls
+    ):
+        raise BudgetExceeded(
+            "account_feature_hourly_calls",
+            scope=f"account:{candidate.threads_account_id}",
+            current=snapshot.account_feature_hour_calls,
+            limit=limits.account_feature_hourly_calls,
         )
 
     prospective_calls = snapshot.current_hour_calls + 1
@@ -505,6 +527,16 @@ class PostgresUsageStore:
                                   and feature = :feature
                               ) as account_feature_calls,
                               count(*) filter (
+                                where threads_account_id = :account_id
+                                  and feature = :feature
+                                  and created_at >= (
+                                    date_trunc(
+                                      'hour',
+                                      now() at time zone 'UTC'
+                                    ) at time zone 'UTC'
+                                  )
+                              ) as account_feature_hour_calls,
+                              count(*) filter (
                                 where feature = :feature
                                   and created_at >= (
                                     date_trunc(
@@ -573,6 +605,9 @@ class PostgresUsageStore:
                     run_calls=int(row["run_calls"] or 0),
                     account_feature_calls=int(
                         row["account_feature_calls"] or 0
+                    ),
+                    account_feature_hour_calls=int(
+                        row.get("account_feature_hour_calls") or 0
                     ),
                     current_hour_calls=int(row["current_hour_calls"] or 0),
                     recent_hour_calls=recent_hours,

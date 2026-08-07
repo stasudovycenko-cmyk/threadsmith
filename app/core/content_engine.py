@@ -26,6 +26,7 @@ from app.schemas.content_engine import (
     ContentGenerationDraft,
     ContentGenerationResponse,
 )
+from app.schemas.autocontent import RepairReason
 from app.schemas.llm import HookType
 from app.schemas.social_brain import BrainTaskContext
 
@@ -181,13 +182,73 @@ class ContentPlan:
 @dataclass(frozen=True)
 class QualityGateResult:
     passed: bool
-    reasons: tuple[str, ...] = ()
+    reasons: tuple[RepairReason, ...] = ()
 
 
 def normalize_content_text(value: str) -> str:
     normalized = unicodedata.normalize("NFKC", value or "").casefold()
     normalized = _PUNCT_RE.sub(" ", normalized)
     return " ".join(normalized.split())
+
+
+def _normalize_draft_text(value: str) -> str:
+    lines = [" ".join(line.split()) for line in (value or "").splitlines()]
+    compact = []
+    for line in lines:
+        if line or (compact and compact[-1]):
+            compact.append(line)
+    return "\n".join(compact).strip()
+
+
+def _safe_trim(value: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if len(value) <= limit:
+        return value
+    cut = value[:limit]
+    sentence_end = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+    if sentence_end >= max(20, limit // 2):
+        return cut[:sentence_end + 1].strip()
+    word_cut = cut.rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return word_cut or cut.rstrip()
+
+
+def normalize_generation_draft(
+    draft: ContentGenerationDraft,
+    *,
+    max_length: int = 420,
+) -> tuple[ContentGenerationDraft, tuple[str, ...]]:
+    """Apply mechanical fixes before deciding on semantic repair."""
+    data = draft.model_dump(mode="json")
+    fixes: list[str] = []
+    for hook in data["hooks"]:
+        normalized = _normalize_draft_text(hook["text"]).replace("—", "-")
+        if normalized != hook["text"]:
+            fixes.append("hook_format")
+            hook["text"] = normalized
+    body = _normalize_draft_text(data["body"]).replace("—", "-")
+    if body != data["body"]:
+        fixes.append("body_format")
+        data["body"] = body
+
+    selected = data["hooks"][data["selected_hook_index"]]
+    if len(selected["text"]) > 160:
+        selected["text"] = _safe_trim(selected["text"], 160)
+        fixes.append("safe_hook_trim")
+    available_body = max_length - len(selected["text"]) - 2
+    if available_body >= 20 and len(data["body"]) > available_body:
+        data["body"] = _safe_trim(data["body"], available_body)
+        fixes.append("safe_body_trim")
+
+    # The previous compact example advertised 0.0, so models copied a
+    # technical placeholder that was then mistaken for a quality verdict.
+    if data["specificity"] == 0 and len(data["body"]) >= 20:
+        data["specificity"] = 0.5
+        fixes.append("specificity_default")
+    return (
+        ContentGenerationDraft.model_validate(data),
+        tuple(dict.fromkeys(fixes)),
+    )
 
 
 def opening_line(value: str) -> str:
@@ -839,38 +900,38 @@ def quality_gate(
     *,
     memory: Sequence[ContentMemoryItem] = (),
 ) -> QualityGateResult:
-    reasons = []
+    reasons: list[RepairReason] = []
     selected = response.hooks[response.metadata.selected_hook_index]
     body = response.body.strip()
     combined = f"{selected.text.strip()}\n\n{body}".strip()
     if not selected.text.strip():
-        reasons.append("missing_hook")
+        reasons.append(RepairReason.HOOK_MISSING)
     if len(body) < 20:
-        reasons.append("empty_or_too_short_body")
+        reasons.append(RepairReason.TOO_SHORT)
     if len(combined) > 420:
-        reasons.append("post_too_long")
+        reasons.append(RepairReason.TOO_LONG)
     normalized_hooks = [
         normalize_content_text(hook.text)
         for hook in response.hooks
     ]
     if len(set(normalized_hooks)) != len(normalized_hooks):
-        reasons.append("duplicate_hooks")
+        reasons.append(RepairReason.HOOK_DUPLICATE)
     combined_normalized = normalize_content_text(combined)
     if any(
         normalize_content_text(phrase) in combined_normalized
         for phrase in _BANNED_PHRASES
     ):
-        reasons.append("banned_phrase")
+        reasons.append(RepairReason.BANNED_PHRASE)
     if len(_EMOJI_RE.findall(combined)) > 3:
-        reasons.append("too_many_emojis")
+        reasons.append(RepairReason.TOO_MANY_EMOJIS)
     repeated = repeated_reason(response, memory)
     if repeated:
-        reasons.append(repeated)
+        reasons.append(RepairReason(repeated))
     goal = normalize_goal(response.metadata.goal)
     if goal.normalized == "engagement" and not response.metadata.has_cta:
-        reasons.append("missing_engagement_cta")
+        reasons.append(RepairReason.CTA_MISSING)
     if response.quality.specificity < 0.25 and len(body) < 80:
-        reasons.append("weak_specificity")
+        reasons.append(RepairReason.QUALITY_SCORE_LOW)
     return QualityGateResult(
         passed=not reasons,
         reasons=tuple(dict.fromkeys(reasons)),

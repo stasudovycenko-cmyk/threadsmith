@@ -38,6 +38,13 @@ from app.core.autopost_status import (
     normalize_error,
     parse_slots,
 )
+from app.core.autocontent_cost import (
+    AutocontentCostGuard,
+    PlannerAccountTelemetry,
+    load_run_token_usage,
+    log_planner_account,
+    log_semantic_repair,
+)
 from app.core.config import CREDIT_COSTS
 from app.core.content_engine import ContentMemoryRepo
 from app.core.db import Session
@@ -66,7 +73,16 @@ async def autocontent_planner():
 
     planner_run_id = uuid.uuid4().hex
     remaining = AUTOCONTENT_MAX_GENERATIONS_PER_PLANNER_RUN
+    seen_accounts = set()
     for uid, per_day, niche, keywords, acc_id, expires_at in users:
+        if acc_id in seen_accounts:
+            log.warning(
+                "autocontent duplicate account skipped run_id=%s account=%s",
+                planner_run_id,
+                acc_id,
+            )
+            continue
+        seen_accounts.add(acc_id)
         if remaining <= 0:
             log.warning(
                 "autocontent cap stop run_id=%s generated=%s limit=%s",
@@ -133,6 +149,36 @@ async def _plan_for_user(
     planner_run_id: str | None = None,
     max_generations: int = AUTOCONTENT_MAX_GENERATIONS_PER_USER_RUN,
 ) -> int:
+    resolved_run_id = planner_run_id or uuid.uuid4().hex
+    telemetry = PlannerAccountTelemetry(account_id=acc_id)
+    try:
+        return await _plan_for_user_impl(
+            uid,
+            per_day,
+            niche,
+            keywords,
+            acc_id,
+            account_expires_at=account_expires_at,
+            planner_run_id=resolved_run_id,
+            max_generations=max_generations,
+            telemetry=telemetry,
+        )
+    finally:
+        log_planner_account(telemetry, planner_run_id=resolved_run_id)
+
+
+async def _plan_for_user_impl(
+    uid,
+    per_day,
+    niche,
+    keywords,
+    acc_id,
+    *,
+    account_expires_at: datetime | None,
+    planner_run_id: str,
+    max_generations: int,
+    telemetry: PlannerAccountTelemetry,
+) -> int:
     try:
         per_day = int(per_day)
     except (TypeError, ValueError):
@@ -179,33 +225,6 @@ async def _plan_for_user(
             "WHERE user_id = :uid AND threads_account_id = :acc"
         ), {"uid": uid, "acc": acc_id})).first()
         total_posts = trow2[0] if trow2 else 0
-        pending_row = (await s.execute(text("""
-            SELECT count(*)
-            FROM (
-              SELECT post.id
-              FROM scheduled_posts post
-              WHERE post.user_id = :uid
-                AND post.threads_account_id = :acc
-                AND post.status = 'pending'
-                AND post.run_at > now()
-                AND (
-                  post.content_metadata ->> 'source' = 'autocontent'
-                  OR EXISTS (
-                    SELECT 1 FROM autopost_runs linked
-                    WHERE linked.scheduled_post_id = post.id
-                  )
-                )
-              UNION ALL
-              SELECT -run.id
-              FROM autopost_runs run
-              WHERE run.user_id = :uid
-                AND run.threads_account_id = :acc
-                AND run.status = 'pending'
-                AND run.scheduled_post_id IS NULL
-                AND run.scheduled_at > now()
-            ) auto_queue
-        """), {"uid": uid, "acc": acc_id})).first()
-        pending_count = int(pending_row[0] if pending_row else 0)
         try:
             brain = await social_brain.build_account_context(
                 s,
@@ -250,15 +269,6 @@ async def _plan_for_user(
         return 0
     if per_day == 0 or not profile:
         return 0
-    if pending_count >= AUTOCONTENT_MAX_PENDING_POSTS:
-        log.warning(
-            "autocontent pending cap uid=%s pending=%s limit=%s",
-            uid,
-            pending_count,
-            AUTOCONTENT_MAX_PENDING_POSTS,
-        )
-        return 0
-
     kws = keywords or [niche]
     settings = AutopostSettings(
         enabled=True,
@@ -267,27 +277,38 @@ async def _plan_for_user(
         days=days,
         timezone=timezone_name,
     )
-    pending_capacity = AUTOCONTENT_MAX_PENDING_POSTS - pending_count
+    planning_now = datetime.now(timezone.utc)
+    async with Session() as s:
+        deficit = await AutopostStatusService(s).planning_deficit(
+            uid,
+            acc_id,
+            settings=settings,
+            now=planning_now,
+            pending_cap=AUTOCONTENT_MAX_PENDING_POSTS,
+        )
+        await s.commit()
+    telemetry.deficit_before = deficit
     generation_count = _bounded_generation_count(
-        need=pending_capacity,
+        need=deficit,
         max_generations=max_generations,
-        pending_count=pending_count,
-        available_slots=pending_capacity,
+        pending_count=0,
+        available_slots=deficit,
     )
     if generation_count <= 0:
         return 0
 
     attempts = 0
-    usage_context = AIUsageContext(
-        user_id=uid,
-        threads_account_id=acc_id,
-        run_id=(
-            f"autocontent:{planner_run_id or uuid.uuid4().hex}:"
-            f"{uid}:{acc_id}"
-        ),
-    )
     for i in range(generation_count):
         reservation_now = datetime.now(timezone.utc)
+        async with Session() as s:
+            guard = await AutocontentCostGuard(s).check(
+                uid,
+                acc_id,
+                now=reservation_now,
+            )
+            await s.commit()
+        if guard.blocked:
+            break
         async with Session() as s:
             reservation = await AutopostStatusService(
                 s
@@ -296,11 +317,19 @@ async def _plan_for_user(
                 acc_id,
                 settings=settings,
                 now=reservation_now,
+                pending_cap=AUTOCONTENT_MAX_PENDING_POSTS,
             )
             await s.commit()
         if reservation is None:
             return attempts
         run_id, run_at = reservation
+        telemetry.slots_claimed += 1
+        usage_run_id = f"autocontent-slot:{run_id}"
+        usage_context = AIUsageContext(
+            user_id=uid,
+            threads_account_id=acc_id,
+            run_id=usage_run_id,
+        )
 
         if (
             account_expires_at is not None
@@ -324,10 +353,18 @@ async def _plan_for_user(
         else:
             topic = f"{niche}: {random.choice(kws)}"
         cost = CREDIT_COSTS["generate_post"]
+        charged = False
 
         async with Session() as s:
             try:
-                await credits.spend(s, uid, cost, "autocontent")
+                charged = await credits.spend_once(
+                    s,
+                    uid,
+                    acc_id,
+                    cost,
+                    "autocontent",
+                    f"autocontent:{run_id}",
+                )
                 await s.commit()
             except credits.NotEnoughCredits:
                 await s.rollback()
@@ -357,7 +394,8 @@ async def _plan_for_user(
             )
         except LLMGuardError as error:
             async with Session() as s:
-                await credits.topup(s, uid, cost, "refund_autocontent")
+                if charged:
+                    await credits.topup(s, uid, cost, "refund_autocontent")
                 code, message = normalize_error(
                     error,
                     stage="generation",
@@ -374,10 +412,30 @@ async def _plan_for_user(
                 uid,
                 type(error).__name__,
             )
+            telemetry.failed += 1
+            repair_reasons = [
+                getattr(reason, "name", str(reason))
+                for reason in getattr(error, "repair_reasons", ())
+            ]
+            if repair_reasons:
+                async with Session() as s:
+                    usage = await load_run_token_usage(
+                        s,
+                        account_id=acc_id,
+                        run_id=usage_run_id,
+                    )
+                log_semantic_repair(
+                    account_id=acc_id,
+                    run_id=usage_run_id,
+                    reasons=repair_reasons,
+                    usage=usage,
+                    status="failure",
+                )
             return attempts
         except Exception as error:
             async with Session() as s:
-                await credits.topup(s, uid, cost, "refund_autocontent")
+                if charged:
+                    await credits.topup(s, uid, cost, "refund_autocontent")
                 code, message = normalize_error(
                     error,
                     stage="generation",
@@ -396,6 +454,25 @@ async def _plan_for_user(
                 acc_id,
                 type(error).__name__,
             )
+            telemetry.failed += 1
+            repair_reasons = [
+                getattr(reason, "name", str(reason))
+                for reason in getattr(error, "repair_reasons", ())
+            ]
+            if repair_reasons:
+                async with Session() as s:
+                    usage = await load_run_token_usage(
+                        s,
+                        account_id=acc_id,
+                        run_id=usage_run_id,
+                    )
+                log_semantic_repair(
+                    account_id=acc_id,
+                    run_id=usage_run_id,
+                    reasons=repair_reasons,
+                    usage=usage,
+                    status="failure",
+                )
             return attempts
 
         # собираем пост: выбранный хук + тело
@@ -451,12 +528,13 @@ async def _plan_for_user(
                     )
                 ).first()
                 if _should_refund_unattached_generation(run_state):
-                    await credits.topup(
-                        s,
-                        uid,
-                        cost,
-                        "refund_autocontent_disabled",
-                    )
+                    if charged:
+                        await credits.topup(
+                            s,
+                            uid,
+                            cost,
+                            "refund_autocontent_disabled",
+                        )
                 await s.commit()
                 return attempts
             await service.attach_post(
@@ -464,5 +542,33 @@ async def _plan_for_user(
                 row[0],
             )
             await s.commit()
+        telemetry.generated += 1
+        repair_reasons = list(metadata.get("repair_reasons") or [])
+        if repair_reasons:
+            telemetry.repaired += 1
+            async with Session() as s:
+                usage = await load_run_token_usage(
+                    s,
+                    account_id=acc_id,
+                    run_id=usage_run_id,
+                )
+            log_semantic_repair(
+                account_id=acc_id,
+                run_id=usage_run_id,
+                reasons=repair_reasons,
+                usage=usage,
+                status="success",
+            )
         log.info("autocontent: +пост uid=%s на %s", uid, run_at.isoformat())
+    async with Session() as s:
+        telemetry.deficit_after = await AutopostStatusService(
+            s
+        ).planning_deficit(
+            uid,
+            acc_id,
+            settings=settings,
+            now=datetime.now(timezone.utc),
+            pending_cap=AUTOCONTENT_MAX_PENDING_POSTS,
+        )
+        await s.commit()
     return attempts
