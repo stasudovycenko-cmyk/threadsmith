@@ -457,6 +457,23 @@ def test_deterministic_quality_gate_passes_publishable_content():
     assert quality_gate(content_response()).passed
 
 
+def test_deterministic_length_and_specificity_fix_avoid_llm_repair(monkeypatch):
+    calls = []
+
+    async def fake_ask_json(_system, _user, **kwargs):
+        calls.append(kwargs["feature"])
+        return draft_response(body="Concrete " * 80, specificity=0.0)
+
+    monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
+    result = asyncio.run(scenarist.generate_post({}, "AI workflows"))
+    assert calls == ["content_generate"]
+    assert result["metadata"]["pipeline_stage"] == "generate"
+    assert "safe_body_trim" in result["metadata"]["deterministic_fixes"]
+    assert "specificity_default" in result["metadata"]["deterministic_fixes"]
+    selected = result["selected_hook"]["text"]
+    assert len(f"{selected}\n\n{result['body']}") <= 420
+
+
 def test_selected_hook_and_metadata_are_canonicalized(monkeypatch):
     calls = []
 
@@ -498,7 +515,9 @@ def test_generation_uses_cost_engine_feature_and_one_normal_call(monkeypatch):
 def test_repair_uses_cost_engine_and_runs_at_most_once(monkeypatch):
     calls = []
     responses = [
-        draft_response(body="x" * 500),
+        draft_response(body=(
+            "Вот что понял: конкретный вывод с достаточной длиной текста."
+        )),
         draft_response(),
     ]
 
@@ -513,7 +532,7 @@ def test_repair_uses_cost_engine_and_runs_at_most_once(monkeypatch):
         "content_generate",
         "content_repair",
     ]
-    assert "post_too_long" in calls[1][0]
+    assert "banned_phrase" in calls[1][0]
 
 
 def test_engagement_cta_policy_survives_compact_response(monkeypatch):
@@ -544,7 +563,9 @@ def test_second_quality_failure_stops_after_one_repair(monkeypatch):
 
     async def fake_ask_json(_system, _user, **kwargs):
         calls.append(kwargs["feature"])
-        return draft_response(body="x" * 500)
+        return draft_response(body=(
+            "Вот что понял: конкретный вывод с достаточной длиной текста."
+        ))
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     with pytest.raises(scenarist.ContentQualityError):
@@ -559,7 +580,9 @@ def test_budget_guard_blocks_repair_without_fallback_call(monkeypatch):
         calls.append(kwargs["feature"])
         if kwargs["feature"] == "content_repair":
             raise LLMGuardError("budget exhausted")
-        return draft_response(body="x" * 500)
+        return draft_response(body=(
+            "Вот что понял: конкретный вывод с достаточной длиной текста."
+        ))
 
     monkeypatch.setattr(scenarist, "ask_json", fake_ask_json)
     with pytest.raises(LLMGuardError, match="budget exhausted"):

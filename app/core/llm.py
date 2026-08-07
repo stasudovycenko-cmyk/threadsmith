@@ -27,6 +27,7 @@ from app.core.ai_cost import (
     UsageReservation,
 )
 from app.core.config import settings
+from app.schemas.autocontent import RepairReason
 
 log = logging.getLogger("llm")
 client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
@@ -243,6 +244,53 @@ def _repair_prompt(raw: str, error: Exception) -> str:
     return (
         f"Ошибка:\n{_validation_error_text(error)}\n\n"
         f"Исходный output:\n{raw}"
+    )
+
+
+def _typed_repair_reason(error: Exception) -> RepairReason:
+    if isinstance(error, json.JSONDecodeError):
+        return RepairReason.JSON_INVALID
+    if isinstance(error, ValidationError):
+        technical_fields = {"selected_hook_index", "specificity", "metadata"}
+        if any(
+            item["loc"] and str(item["loc"][0]) in technical_fields
+            for item in error.errors(include_url=False, include_input=False)
+        ):
+            return RepairReason.METADATA_INVALID
+        return RepairReason.FORMAT_INVALID
+    return RepairReason.UNKNOWN
+
+
+def _log_typed_repair(
+    *,
+    feature: str,
+    reason: RepairReason,
+    original_usage: object | None,
+    repair_usage: object | None,
+    context: AIUsageContext,
+    status: str,
+) -> None:
+    log.info(
+        "llm_repair %s",
+        json.dumps(
+            {
+                "event": "llm_repair",
+                "feature": feature,
+                "repair_reason": reason.name,
+                "original_input_tokens": _usage_value(
+                    original_usage, "input_tokens"
+                ),
+                "repair_input_tokens": _usage_value(
+                    repair_usage, "input_tokens"
+                ),
+                "user_id": context.user_id,
+                "threads_account_id": context.threads_account_id,
+                "run_id": context.run_id,
+                "status": status,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ),
     )
 
 
@@ -511,6 +559,7 @@ async def _ask_typed(
         )
     except (json.JSONDecodeError, ValidationError) as error:
         validation_error = error
+        repair_reason = _typed_repair_reason(error)
         log.warning(
             "llm response validation failed; requesting one repair: "
             "model=%s error=%s",
@@ -523,6 +572,7 @@ async def _ask_typed(
             f"LLM response validation failed for {response_model.__name__}"
         )
 
+    repair_call = None
     try:
         repair_call = await _request(
             _REPAIR_SYSTEM,
@@ -533,7 +583,7 @@ async def _ask_typed(
             context=context,
             request_id=request_id,
         )
-        return await _validate_call(
+        result = await _validate_call(
             repair_call,
             response_model,
             feature=feature,
@@ -541,9 +591,26 @@ async def _ask_typed(
             attempt=2,
             context=context,
         )
+        _log_typed_repair(
+            feature=feature,
+            reason=repair_reason,
+            original_usage=call.usage,
+            repair_usage=repair_call.usage,
+            context=context,
+            status="success",
+        )
+        return result
     except LLMGuardError:
         raise
     except Exception as repair_error:
+        _log_typed_repair(
+            feature=feature,
+            reason=repair_reason,
+            original_usage=call.usage,
+            repair_usage=(repair_call.usage if repair_call else None),
+            context=context,
+            status="failure",
+        )
         log.error(
             "llm response repair failed: model=%s error=%s",
             response_model.__name__,

@@ -34,6 +34,7 @@ SCHEDULE_LEAD_MINUTES = 10
 MISFIRE_GRACE_MINUTES = 10
 STALE_GENERATION_MINUTES = 30
 STALE_PUBLISH_MINUTES = 15
+GENERATION_RETRY_COOLDOWN_MINUTES = 60
 PLANNING_ACTIVE_DAYS = 4
 PLANNING_SEARCH_DAYS = 32
 QUEUE_CLEARED_MESSAGE = "Пропущено: очередь очищена"
@@ -57,7 +58,9 @@ _ACCOUNT_SETTINGS_SQL = text("""
       coalesce(ac.posts_per_day, 1) AS posts_per_day,
       coalesce(ac.slots, '') AS slots,
       coalesce(ac.days, 'all') AS days,
-      coalesce(ac.timezone, :default_timezone) AS timezone
+      coalesce(ac.timezone, :default_timezone) AS timezone,
+      ac.cost_guard_until,
+      ac.cost_guard_reason
     FROM threads_accounts ta
     LEFT JOIN autocontent_settings ac
       ON ac.threads_account_id = ta.id
@@ -177,6 +180,47 @@ _MANUAL_BLOCKED_SQL = text("""
         SELECT 1 FROM autopost_runs run
         WHERE run.scheduled_post_id = post.id
       )
+""")
+
+_RETRY_BLOCKED_SQL = text("""
+    SELECT run.scheduled_at
+    FROM autopost_runs run
+    WHERE run.user_id = :uid
+      AND run.threads_account_id = :account_id
+      AND run.status = 'failed'
+      AND run.error_code IN (
+        'GENERATION_FAILED', 'QUALITY_FAILED', 'UNKNOWN_ERROR'
+      )
+      AND run.finished_at > :retry_cutoff
+      AND run.scheduled_at >= :window_start
+      AND run.scheduled_at < :window_end
+""")
+
+_PENDING_AUTO_COUNT_SQL = text("""
+    SELECT count(*)
+    FROM (
+      SELECT post.id
+      FROM scheduled_posts post
+      WHERE post.user_id = :uid
+        AND post.threads_account_id = :account_id
+        AND post.status = 'pending'
+        AND post.run_at > :now
+        AND (
+          post.content_metadata ->> 'source' = 'autocontent'
+          OR EXISTS (
+            SELECT 1 FROM autopost_runs linked
+            WHERE linked.scheduled_post_id = post.id
+          )
+        )
+      UNION ALL
+      SELECT -run.id
+      FROM autopost_runs run
+      WHERE run.user_id = :uid
+        AND run.threads_account_id = :account_id
+        AND run.status = 'pending'
+        AND run.scheduled_post_id IS NULL
+        AND run.scheduled_at > :now
+    ) auto_queue
 """)
 
 _AUTO_QUEUE_SQL = text("""
@@ -568,6 +612,13 @@ class AutopostStatusService:
                 )
             ).all()
             blocked = [row[0] for row in blocked_rows if row[0]]
+            retry_blocked = await self.retry_blocked_slots(
+                user_id,
+                account_id,
+                now=current,
+                timezone_name=settings.timezone,
+            )
+            blocked.extend(retry_blocked)
             candidates = select_next_slots(
                 now=current,
                 slots=settings.slots,
@@ -585,6 +636,16 @@ class AutopostStatusService:
         if settings.enabled and expires_at <= current:
             error_code = "AUTH_EXPIRED"
             error_message = SAFE_ERROR_MESSAGES["AUTH_EXPIRED"]
+            next_run_at = None
+        guard_until = account_row.get("cost_guard_until")
+        if guard_until is not None:
+            guard_until = ensure_aware(guard_until)
+        if settings.enabled and guard_until and guard_until > current:
+            error_code = "GENERATION_FAILED"
+            error_message = (
+                "Автогенерация временно приостановлена из-за частых "
+                "исправлений. Следующая попытка будет выполнена автоматически."
+            )
             next_run_at = None
 
         return AutopostStatus(
@@ -686,6 +747,121 @@ class AutopostStatusService:
         ).all()
         return [row[0] for row in rows if row[0]]
 
+    async def retry_blocked_slots(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        now: datetime,
+        timezone_name: str,
+    ) -> list[datetime]:
+        current = ensure_aware(now)
+        window_start, window_end = schedule_window(
+            current,
+            timezone_name,
+            days=PLANNING_SEARCH_DAYS,
+        )
+        rows = (
+            await self.session.execute(
+                _RETRY_BLOCKED_SQL,
+                {
+                    "uid": user_id,
+                    "account_id": account_id,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "retry_cutoff": current - timedelta(
+                        minutes=GENERATION_RETRY_COOLDOWN_MINUTES
+                    ),
+                },
+            )
+        ).all()
+        return [row[0] for row in rows if row[0]]
+
+    async def pending_auto_count(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        now: datetime,
+    ) -> int:
+        row = (
+            await self.session.execute(
+                _PENDING_AUTO_COUNT_SQL,
+                {
+                    "uid": user_id,
+                    "account_id": account_id,
+                    "now": ensure_aware(now),
+                },
+            )
+        ).first()
+        return int(row[0] if row else 0)
+
+    async def _planning_candidates_locked(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        settings: AutopostSettings,
+        now: datetime,
+        pending_cap: int | None,
+    ) -> tuple[datetime, ...]:
+        pending_count = await self.pending_auto_count(
+            user_id,
+            account_id,
+            now=now,
+        )
+        if pending_cap is not None and pending_count >= pending_cap:
+            return ()
+        occupied = await self.occupied_slots(
+            user_id,
+            account_id,
+            now=now,
+            timezone_name=settings.timezone,
+        )
+        blocked = await self.blocked_manual_slots(
+            user_id,
+            account_id,
+            now=now,
+            timezone_name=settings.timezone,
+        )
+        blocked.extend(await self.retry_blocked_slots(
+            user_id,
+            account_id,
+            now=now,
+            timezone_name=settings.timezone,
+        ))
+        candidates = select_planning_slots(
+            now=now,
+            slots=settings.slots,
+            days=settings.days,
+            timezone_name=settings.timezone,
+            posts_per_day=settings.posts_per_day,
+            occupied=occupied,
+            blocked=blocked,
+        )
+        if pending_cap is None:
+            return candidates
+        return candidates[:max(0, pending_cap - pending_count)]
+
+    async def planning_deficit(
+        self,
+        user_id: int,
+        account_id: int,
+        *,
+        settings: AutopostSettings,
+        now: datetime,
+        pending_cap: int | None = None,
+    ) -> int:
+        await self.lock_queue(user_id, account_id)
+        candidates = await self._planning_candidates_locked(
+            user_id,
+            account_id,
+            settings=settings,
+            now=ensure_aware(now),
+            pending_cap=pending_cap,
+        )
+        return len(candidates)
+
     async def reserve_run(
         self,
         user_id: int,
@@ -702,10 +878,17 @@ class AutopostStatusService:
                     SELECT
                         :uid, :account_id, :scheduled_at, now(), 'pending'
                     WHERE EXISTS (
-                        SELECT 1 FROM autocontent_settings
-                        WHERE user_id = :uid
-                          AND threads_account_id = :account_id
-                          AND active
+                        SELECT 1
+                        FROM autocontent_settings setting
+                        JOIN threads_accounts account
+                          ON account.id = setting.threads_account_id
+                         AND account.user_id = setting.user_id
+                        WHERE setting.user_id = :uid
+                          AND setting.threads_account_id = :account_id
+                          AND setting.active
+                          AND account.connection_status = 'connected'
+                          AND account.access_token_enc IS NOT NULL
+                          AND account.expires_at > now()
                     )
                     ON CONFLICT DO NOTHING
                     RETURNING id
@@ -726,28 +909,15 @@ class AutopostStatusService:
         *,
         settings: AutopostSettings,
         now: datetime,
+        pending_cap: int | None = None,
     ) -> tuple[int, datetime] | None:
         await self.lock_queue(user_id, account_id)
-        occupied = await self.occupied_slots(
+        candidates = await self._planning_candidates_locked(
             user_id,
             account_id,
-            now=now,
-            timezone_name=settings.timezone,
-        )
-        blocked = await self.blocked_manual_slots(
-            user_id,
-            account_id,
-            now=now,
-            timezone_name=settings.timezone,
-        )
-        candidates = select_planning_slots(
-            now=now,
-            slots=settings.slots,
-            days=settings.days,
-            timezone_name=settings.timezone,
-            posts_per_day=settings.posts_per_day,
-            occupied=occupied,
-            blocked=blocked,
+            settings=settings,
+            now=ensure_aware(now),
+            pending_cap=pending_cap,
         )
         for scheduled_at in candidates:
             run_id = await self.reserve_run(

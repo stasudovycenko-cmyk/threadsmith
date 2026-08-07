@@ -23,6 +23,7 @@ from app.core.content_engine import (
     compact_brief_prompt,
     compact_memory_prompt,
     memory_prompt,
+    normalize_generation_draft,
     quality_gate,
 )
 from app.core.context_builder import estimate_text_tokens
@@ -167,7 +168,7 @@ VOICE_JSON:
 - Не повторяй openings/strategies из AVOID. Reference задаёт механику, не текст.
 
 Верни только JSON:
-{{"hooks":[{{"type":"...","text":"..."}},{{"type":"...","text":"..."}},{{"type":"...","text":"..."}}],"body":"...","selected_hook_index":0,"specificity":0.0}}"""
+{{"hooks":[{{"type":"...","text":"..."}},{{"type":"...","text":"..."}},{{"type":"...","text":"..."}}],"body":"...","selected_hook_index":0,"specificity":0.5}}"""
 
 
 @dataclass(frozen=True)
@@ -206,6 +207,10 @@ class ContentPromptBenchmark:
 
 class ContentQualityError(LLMError):
     """The single generation and optional targeted repair both failed."""
+
+    def __init__(self, message: str, *, repair_reasons=()):
+        super().__init__(message)
+        self.repair_reasons = tuple(repair_reasons)
 
 
 def _profile_str(profile: dict) -> str:
@@ -570,7 +575,10 @@ def _targeted_repair_prompt(
     parts = [
         "Исправь draft только по перечисленным причинам.",
         "FAILURES:",
-        json.dumps(list(reasons), ensure_ascii=False),
+        json.dumps(
+            [getattr(reason, "value", str(reason)) for reason in reasons],
+            ensure_ascii=False,
+        ),
         "BRIEF:",
         brief_text,
     ]
@@ -591,6 +599,8 @@ def _public_content_result(
     response: ContentGenerationResponse,
     *,
     quality_reasons: Sequence[str],
+    repair_reasons: Sequence[str] = (),
+    deterministic_fixes: Sequence[str] = (),
 ) -> dict:
     result = response.model_dump(mode="json")
     index = response.metadata.selected_hook_index
@@ -605,6 +615,13 @@ def _public_content_result(
         "passed": not quality_reasons,
         "reasons": list(quality_reasons),
     }
+    result["metadata"]["repair_reasons"] = [
+        getattr(reason, "name", str(reason))
+        for reason in repair_reasons
+    ]
+    result["metadata"]["deterministic_fixes"] = list(
+        dict.fromkeys(deterministic_fixes)
+    )
     return result
 
 
@@ -685,6 +702,7 @@ async def generate_post(
         feature=generation_feature,
         usage_context=usage_context,
     )
+    draft, deterministic_fixes = normalize_generation_draft(draft)
     response = canonicalize_draft_response(
         draft,
         plan=plan,
@@ -697,26 +715,52 @@ async def generate_post(
     )
     gate = quality_gate(response, memory=memory_items)
     if gate.passed:
-        return _public_content_result(response, quality_reasons=())
+        return _public_content_result(
+            response,
+            quality_reasons=(),
+            deterministic_fixes=deterministic_fixes,
+        )
 
     repair_feature = (
         "autocontent_repair"
         if feature == "autocontent"
         else "content_repair"
     )
-    repaired = await ask_json(
-        prompt.system,
-        _targeted_repair_prompt(
-            draft=draft,
-            reasons=gate.reasons,
-            plan=plan,
-            memory=memory_items,
+    log.info(
+        "content_repair_requested %s",
+        json.dumps(
+            {
+                "feature": repair_feature,
+                "repair_reasons": [reason.name for reason in gate.reasons],
+                "user_id": usage_context.user_id if usage_context else None,
+                "threads_account_id": (
+                    usage_context.threads_account_id
+                    if usage_context else None
+                ),
+                "run_id": usage_context.run_id if usage_context else None,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
         ),
-        max_tokens=LLM_MAX_TOKENS[repair_feature],
-        response_model=ContentGenerationDraft,
-        feature=repair_feature,
-        usage_context=usage_context,
     )
+    try:
+        repaired = await ask_json(
+            prompt.system,
+            _targeted_repair_prompt(
+                draft=draft,
+                reasons=gate.reasons,
+                plan=plan,
+                memory=memory_items,
+            ),
+            max_tokens=LLM_MAX_TOKENS[repair_feature],
+            response_model=ContentGenerationDraft,
+            feature=repair_feature,
+            usage_context=usage_context,
+        )
+    except Exception as error:
+        error.repair_reasons = tuple(gate.reasons)
+        raise
+    repaired, repair_fixes = normalize_generation_draft(repaired)
     repaired = canonicalize_draft_response(
         repaired,
         plan=plan,
@@ -734,9 +778,15 @@ async def generate_post(
             ",".join(repaired_gate.reasons),
         )
         raise ContentQualityError(
-            "Content quality gate failed after one repair"
+            "Content quality gate failed after one repair",
+            repair_reasons=gate.reasons,
         )
-    return _public_content_result(repaired, quality_reasons=())
+    return _public_content_result(
+        repaired,
+        quality_reasons=(),
+        repair_reasons=gate.reasons,
+        deterministic_fixes=(*deterministic_fixes, *repair_fixes),
+    )
 
 
 async def rewrite_post(
